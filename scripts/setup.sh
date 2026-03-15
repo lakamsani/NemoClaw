@@ -113,17 +113,41 @@ cp -r "$REPO_DIR/nemoclaw-blueprint" "$BUILD_CTX/nemoclaw-blueprint"
 cp -r "$REPO_DIR/scripts" "$BUILD_CTX/scripts"
 rm -rf "$BUILD_CTX/nemoclaw/node_modules" "$BUILD_CTX/nemoclaw/src"
 
-# Filter build output: show progress steps, hide apt noise and env dump
-# (openshell prints all env vars including NVIDIA_API_KEY after creation)
+# Verify nemoclaw/dist/ exists (TypeScript must be pre-built)
+if [ ! -d "$BUILD_CTX/nemoclaw/dist" ] || [ -z "$(ls -A "$BUILD_CTX/nemoclaw/dist" 2>/dev/null)" ]; then
+  rm -rf "$BUILD_CTX"
+  fail "nemoclaw/dist/ is missing or empty. Run 'cd nemoclaw && npm install && npm run build' first."
+fi
+
+# Capture full output to a temp file so we can filter for display but still
+# detect failures. The raw log is kept on failure for debugging.
+CREATE_LOG=$(mktemp /tmp/nemoclaw-create-XXXXXX.log)
+set +e
 openshell sandbox create --from "$BUILD_CTX/Dockerfile" --name nemoclaw \
   --provider nvidia-nim \
-  -- env NVIDIA_API_KEY="$NVIDIA_API_KEY" 2>&1 | \
-  grep -E "^  (Step |Building |Built |Pushing |\[progress\]|Successfully |Created sandbox|Image )|✓"
+  -- env NVIDIA_API_KEY="$NVIDIA_API_KEY" > "$CREATE_LOG" 2>&1
+CREATE_RC=$?
+set -e
 rm -rf "$BUILD_CTX"
 
-# Verify sandbox was actually created
-if ! openshell sandbox list 2>&1 | grep -q "nemoclaw"; then
-  fail "Sandbox creation failed. You may need more RAM (8GB+ recommended). Check 'docker logs' for details."
+# Show progress lines (filter apt noise and env var dumps that contain NVIDIA_API_KEY)
+grep -E "^  (Step |Building |Built |Pushing |\[progress\]|Successfully |Created sandbox|Image )|✓" "$CREATE_LOG" || true
+
+if [ "$CREATE_RC" != "0" ]; then
+  echo ""
+  warn "Last 20 lines of build output:"
+  tail -20 "$CREATE_LOG" | grep -v "NVIDIA_API_KEY"
+  echo ""
+  fail "Sandbox creation failed (exit $CREATE_RC). Full log: $CREATE_LOG"
+fi
+rm -f "$CREATE_LOG"
+
+# Verify sandbox is Ready (not just that a record exists)
+# Strip ANSI color codes before checking phase
+SANDBOX_LINE=$(openshell sandbox list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep "nemoclaw")
+if ! echo "$SANDBOX_LINE" | grep -q "Ready"; then
+  SANDBOX_PHASE=$(echo "$SANDBOX_LINE" | awk '{print $NF}')
+  fail "Sandbox created but not Ready (phase: ${SANDBOX_PHASE:-unknown}). Check 'openshell sandbox get nemoclaw' and Docker logs."
 fi
 
 # 6. Done
