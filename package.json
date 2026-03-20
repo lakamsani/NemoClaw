@@ -11,7 +11,8 @@
     "prepare": "cd nemoclaw && env -u npm_config_global -u npm_config_prefix -u npm_config_omit npm install --ignore-scripts && ./node_modules/.bin/tsc"
   },
   "dependencies": {
-    "openclaw": "2026.3.11"
+    "openclaw": "2026.3.11",
+    "@slack/bolt": "^4.2.0"
   },
   "files": [
     "bin/",

@@ -2,21 +2,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Start NemoClaw auxiliary services: Telegram bridge
-# and cloudflared tunnel for public access.
+# Start NemoClaw auxiliary services: Slack bridge.
 #
 # Usage:
-#   TELEGRAM_BOT_TOKEN=... ./scripts/start-services.sh         # start all
-#   ./scripts/start-services.sh --status                       # check status
-#   ./scripts/start-services.sh --stop                         # stop all
-#   ./scripts/start-services.sh --sandbox mybox                # start for specific sandbox
-#   ./scripts/start-services.sh --sandbox mybox --stop         # stop for specific sandbox
+#   SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... ./scripts/start-services.sh
+#   ./scripts/start-services.sh --status
+#   ./scripts/start-services.sh --stop
+#   ./scripts/start-services.sh --sandbox mybox
+#   ./scripts/start-services.sh --sandbox mybox --stop
+#
+# Optional env:
+#   ALLOWED_USERS     — comma-separated Slack user IDs to accept (default: all)
+#   ALLOWED_CHANNELS  — comma-separated Slack channel IDs to accept (default: all)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DASHBOARD_PORT="${DASHBOARD_PORT:-18789}"
+
+# Source .env if present (tokens, access control, sandbox name)
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$REPO_DIR/.env"
+  set +a
+fi
 
 # ── Parse flags ──────────────────────────────────────────────────
 SANDBOX_NAME="${NEMOCLAW_SANDBOX:-${SANDBOX_NAME:-default}}"
@@ -94,7 +104,7 @@ stop_service() {
 show_status() {
   mkdir -p "$PIDDIR"
   echo ""
-  for svc in telegram-bridge cloudflared; do
+  for svc in slack-bridge; do
     if is_running "$svc"; then
       echo -e "  ${GREEN}●${NC} $svc  (PID $(cat "$PIDDIR/$svc.pid"))"
     else
@@ -102,29 +112,20 @@ show_status() {
     fi
   done
   echo ""
-
-  if [ -f "$PIDDIR/cloudflared.log" ]; then
-    local url
-    url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$PIDDIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-    if [ -n "$url" ]; then
-      info "Public URL: $url"
-    fi
-  fi
 }
 
 do_stop() {
   mkdir -p "$PIDDIR"
-  stop_service cloudflared
-  stop_service telegram-bridge
+  stop_service slack-bridge
   info "All services stopped."
 }
 
 do_start() {
   [ -n "${NVIDIA_API_KEY:-}" ] || fail "NVIDIA_API_KEY required"
 
-  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    warn "TELEGRAM_BOT_TOKEN not set — Telegram bridge will not start."
-    warn "Create a bot via @BotFather on Telegram and set the token."
+  if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_APP_TOKEN:-}" ]; then
+    warn "SLACK_BOT_TOKEN / SLACK_APP_TOKEN not set — Slack bridge will not start."
+    warn "Create a Slack app at https://api.slack.com/apps with Socket Mode enabled."
   fi
 
   command -v node > /dev/null || fail "node not found. Install Node.js first."
@@ -132,37 +133,16 @@ do_start() {
   # Verify sandbox is running
   if command -v openshell > /dev/null 2>&1; then
     if ! openshell sandbox list 2>&1 | grep -q "Ready"; then
-      warn "No sandbox in Ready state. Telegram bridge may not work until sandbox is running."
+      warn "No sandbox in Ready state. Slack bridge may not work until sandbox is running."
     fi
   fi
 
   mkdir -p "$PIDDIR"
 
-  # Telegram bridge (only if token provided)
-  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    SANDBOX_NAME="$SANDBOX_NAME" start_service telegram-bridge \
-      node "$REPO_DIR/scripts/telegram-bridge.js"
-  fi
-
-  # 3. cloudflared tunnel
-  if command -v cloudflared > /dev/null 2>&1; then
-    start_service cloudflared \
-      cloudflared tunnel --url "http://localhost:$DASHBOARD_PORT"
-  else
-    warn "cloudflared not found — no public URL. Install: brev-setup.sh or manually."
-  fi
-
-  # Wait for cloudflared to publish URL
-  if is_running cloudflared; then
-    info "Waiting for tunnel URL..."
-    for _ in $(seq 1 15); do
-      local url
-      url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$PIDDIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-      if [ -n "$url" ]; then
-        break
-      fi
-      sleep 1
-    done
+  # Slack bridge (only if both tokens provided)
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_APP_TOKEN:-}" ]; then
+    SANDBOX_NAME="$SANDBOX_NAME" ALLOWED_USERS="${ALLOWED_USERS:-}" start_service slack-bridge \
+      node "$REPO_DIR/scripts/slack-bridge.js"
   fi
 
   # Print banner
@@ -171,19 +151,10 @@ do_start() {
   echo "  │  NemoClaw Services                                  │"
   echo "  │                                                     │"
 
-  local tunnel_url=""
-  if [ -f "$PIDDIR/cloudflared.log" ]; then
-    tunnel_url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$PIDDIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-  fi
-
-  if [ -n "$tunnel_url" ]; then
-    printf "  │  Public URL:  %-40s│\n" "$tunnel_url"
-  fi
-
-  if is_running telegram-bridge; then
-    echo "  │  Telegram:    bridge running                        │"
+  if is_running slack-bridge; then
+    echo "  │  Slack:       bridge running                        │"
   else
-    echo "  │  Telegram:    not started (no token)                │"
+    echo "  │  Slack:       not started (no token)                │"
   fi
 
   echo "  │                                                     │"

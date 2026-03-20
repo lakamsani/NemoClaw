@@ -2,40 +2,40 @@
 # SPDX-License-Identifier: Apache-2.0
 
 preset:
-  name: slack
-  description: "Slack API and webhooks access"
+  name: xcurl
+  description: "X/Twitter API access for xcurl skill"
 
 network_policies:
-  slack:
-    name: slack
-    endpoints:
-      - host: slack.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: GET, path: "/**" }
-          - allow: { method: POST, path: "/**" }
-      - host: api.slack.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: GET, path: "/**" }
-          - allow: { method: POST, path: "/**" }
-      - host: hooks.slack.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: GET, path: "/**" }
-          - allow: { method: POST, path: "/**" }
+  xcurl:
+    name: xcurl
     binaries:
-      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
       - { path: /usr/local/bin/claude }
       - { path: /sandbox/.local/bin/claude }
-      - { path: /usr/local/bin/openclaw }
-      - { path: /usr/bin/curl }
+    endpoints:
+      - host: api.x.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+          - allow: { method: DELETE, path: "/**" }
+      - host: api.twitter.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+          - allow: { method: DELETE, path: "/**" }
+      - host: upload.twitter.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
