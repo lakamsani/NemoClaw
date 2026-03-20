@@ -12,6 +12,25 @@ const MODEL_API_ALIASES = {
   "nvidia/nemotron-3-nano-30b-a3b": "nvidia/nemotron-3-nano",
 };
 
+function normalizeGpuFamily(name) {
+  const value = String(name || "").toLowerCase();
+  if (value.includes("gb10") || value.includes("dgx spark")) return "dgx-spark";
+  if (value.includes("gb200")) return "gb200";
+  if (value.includes("b200")) return "b200";
+  if (value.includes("gh200")) return "gh200";
+  if (value.includes("h200")) return "h200";
+  if (value.includes("h100")) return "h100";
+  if (value.includes("h20")) return "h20";
+  if (value.includes("l40s")) return "l40s";
+  if (value.includes("a10g")) return "a10g";
+  if (value.includes("a100")) return "a100";
+  if (value.includes("rtx 6000 ada")) return "rtx6000-ada";
+  if (value.includes("blackwell server edition")) return "rtx-pro-6000-blackwell";
+  if (value.includes("rtx 5090")) return "rtx5090";
+  if (value.includes("rtx 4090")) return "rtx4090";
+  return null;
+}
+
 function containerName(sandboxName) {
   return `nemoclaw-nim-${sandboxName}`;
 }
@@ -53,12 +72,76 @@ function listModels() {
     name: m.name,
     image: m.image,
     minGpuMemoryMB: m.minGpuMemoryMB,
+    servedModel: m.servedModel || getServedModelForModel(m.name),
+    recommendedRank: m.recommendedRank || Number.MAX_SAFE_INTEGER,
+    recommendedFor: m.recommendedFor || [],
+    profiles: m.profiles || [],
   }));
+}
+
+function detectDiskSpaceGB() {
+  let dockerRoot = "";
+  try {
+    dockerRoot = runner.runCapture("docker info --format '{{.DockerRootDir}}'", {
+      ignoreError: true,
+    });
+  } catch {}
+  const diskPath = dockerRoot || "/var/lib/docker";
+  try {
+    const availableKB = runner.runCapture(`df -Pk ${shellQuote(diskPath)} | awk 'NR==2 {print $4}'`, {
+      ignoreError: true,
+    });
+    const available = parseInt(availableKB, 10);
+    if (!isNaN(available) && available > 0) {
+      return Math.floor(available / 1024 / 1024);
+    }
+  } catch {}
+  return null;
+}
+
+function profileMatches(profile, gpu, freeDiskGB) {
+  const gpuFamilies = profile.gpuFamilies || [];
+  if (gpuFamilies.length > 0) {
+    const families = gpu.families || [];
+    if (!families.some((family) => gpuFamilies.includes(family))) {
+      return false;
+    }
+  }
+  if ((profile.minGpuCount || 1) > gpu.count) {
+    return false;
+  }
+  if ((profile.minPerGpuMemoryMB || 0) > gpu.perGpuMB) {
+    return false;
+  }
+  if (freeDiskGB !== null && (profile.minDiskSpaceGB || 0) > freeDiskGB) {
+    return false;
+  }
+  return true;
+}
+
+function getCompatibleModels(gpu, freeDiskGB = null) {
+  return listModels()
+    .filter((model) => {
+      if (model.profiles.length > 0) {
+        return model.profiles.some((profile) => profileMatches(profile, gpu, freeDiskGB));
+      }
+      return model.minGpuMemoryMB <= gpu.totalMemoryMB;
+    })
+    .sort((a, b) => {
+      if (a.recommendedRank !== b.recommendedRank) {
+        return a.recommendedRank - b.recommendedRank;
+      }
+      return a.minGpuMemoryMB - b.minGpuMemoryMB;
+    });
 }
 
 function detectGpu() {
   // Try NVIDIA first — query VRAM
   try {
+    const nameOutput = runner.runCapture(
+      "nvidia-smi --query-gpu=name --format=csv,noheader,nounits",
+      { ignoreError: true }
+    );
     const output = runner.runCapture(
       "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits",
       { ignoreError: true }
@@ -66,6 +149,8 @@ function detectGpu() {
     if (output) {
       const lines = output.split("\n").filter((l) => l.trim());
       const perGpuMB = lines.map((l) => parseInt(l.trim(), 10)).filter((n) => !isNaN(n));
+      const names = nameOutput.split("\n").map((line) => line.trim()).filter(Boolean);
+      const families = [...new Set(names.map(normalizeGpuFamily).filter(Boolean))];
       if (perGpuMB.length > 0) {
         const totalMemoryMB = perGpuMB.reduce((a, b) => a + b, 0);
         return {
@@ -73,6 +158,10 @@ function detectGpu() {
           count: perGpuMB.length,
           totalMemoryMB,
           perGpuMB: perGpuMB[0],
+          names,
+          family: families[0] || null,
+          families,
+          freeDiskGB: detectDiskSpaceGB(),
           nimCapable: true,
         };
       }
@@ -97,6 +186,10 @@ function detectGpu() {
         count: 1,
         totalMemoryMB,
         perGpuMB: totalMemoryMB,
+        names: ["NVIDIA GB10"],
+        family: "dgx-spark",
+        families: ["dgx-spark"],
+        freeDiskGB: detectDiskSpaceGB(),
         nimCapable: true,
         spark: true,
       };
@@ -246,6 +339,8 @@ module.exports = {
   getServedModelForModel,
   listModels,
   detectGpu,
+  detectDiskSpaceGB,
+  getCompatibleModels,
   pullNimImage,
   startNimContainer,
   waitForNimHealth,

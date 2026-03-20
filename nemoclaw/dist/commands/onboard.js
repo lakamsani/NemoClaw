@@ -127,11 +127,11 @@ function detectLocalNim() {
     if (!gpu || !gpu.nimCapable) {
         return { available: false, reason: "No NIM-capable NVIDIA GPU detected" };
     }
-    const compatibleModels = (0, nim_js_1.listModels)().filter((model) => model.minGpuMemoryMB <= gpu.totalMemoryMB);
+    const compatibleModels = (0, nim_js_1.getCompatibleModels)(gpu, gpu.freeDiskGB ?? null);
     if (compatibleModels.length === 0) {
         return {
             available: false,
-            reason: `GPU detected (${Math.floor(gpu.totalMemoryMB / 1024)} GB), but no bundled NIM models fit`,
+            reason: `GPU detected (${Math.floor(gpu.totalMemoryMB / 1024)} GB), but no bundled NIM models match the GPU/disk profile`,
         };
     }
     return {
@@ -145,7 +145,7 @@ function getCompatibleNimModels() {
     if (!gpu || !gpu.nimCapable) {
         return [];
     }
-    return (0, nim_js_1.listModels)().filter((model) => model.minGpuMemoryMB <= gpu.totalMemoryMB);
+    return (0, nim_js_1.getCompatibleModels)(gpu, gpu.freeDiskGB ?? null);
 }
 function showConfig(config, logger) {
     logger.info(`  Endpoint:    ${(0, config_js_1.describeOnboardEndpoint)(config)}`);
@@ -352,7 +352,7 @@ async function cliOnboard(opts) {
             ? (0, local_inference_js_1.getOllamaModelOptions)(runCapture).map((id) => ({ label: id, value: id }))
             : endpointType === "nim-local"
                 ? getCompatibleNimModels().map((nimModel) => ({
-                    label: `${nimModel.name} (min ${String(Math.floor(nimModel.minGpuMemoryMB / 1024))} GB VRAM)`,
+                    label: `${nimModel.name}${nimModel.recommendedFor?.length ? ` [${nimModel.recommendedFor.join(", ")}]` : ""}`,
                     value: nimModel.name,
                 }))
                 : validation.models.map((id) => ({ label: id, value: id }));
@@ -365,7 +365,7 @@ async function cliOnboard(opts) {
         const defaultIndex = endpointType === "ollama"
             ? Math.max(0, discoveredModelOptions.findIndex((option) => option.value === (0, local_inference_js_1.getDefaultOllamaModel)(runCapture)))
             : endpointType === "nim-local"
-                ? Math.max(0, discoveredModelOptions.findIndex((option) => option.value === "nvidia/nemotron-3-nano-30b-a3b"))
+                ? 0
                 : 0;
         const modelOptions = curatedCloudOptions.length > 0
             ? curatedCloudOptions
@@ -420,9 +420,9 @@ async function cliOnboard(opts) {
             logger.error("Local NIM requires an NVIDIA GPU and a running Docker daemon.");
             return;
         }
-        const supportedModels = (0, nim_js_1.listModels)().filter((nimModel) => nimModel.minGpuMemoryMB <= gpu.totalMemoryMB);
+        const supportedModels = (0, nim_js_1.getCompatibleModels)(gpu, gpu.freeDiskGB ?? null);
         if (!supportedModels.some((nimModel) => nimModel.name === model)) {
-            logger.error(`Selected model '${model}' does not fit the detected GPU (${String(Math.floor(gpu.totalMemoryMB / 1024))} GB VRAM).`);
+            logger.error(`Selected model '${model}' does not match the detected GPU/disk profile (${String(Math.floor(gpu.totalMemoryMB / 1024))} GB VRAM${gpu.freeDiskGB ? `, ${String(gpu.freeDiskGB)} GB free disk` : ""}).`);
             return;
         }
         logger.info(`Pulling local NIM image for ${model}...`);

@@ -21,8 +21,8 @@ import {
 import {
   createNimRuntime,
   detectGpu,
+  getCompatibleModels,
   getServedModelForModel,
-  listModels as listNimModels,
   pullNimImage,
   startNimContainer,
   waitForNimHealth,
@@ -167,11 +167,11 @@ function detectLocalNim(): { available: boolean; gpuSummary?: string; reason?: s
     return { available: false, reason: "No NIM-capable NVIDIA GPU detected" };
   }
 
-  const compatibleModels = listNimModels().filter((model) => model.minGpuMemoryMB <= gpu.totalMemoryMB);
+  const compatibleModels = getCompatibleModels(gpu, gpu.freeDiskGB ?? null);
   if (compatibleModels.length === 0) {
     return {
       available: false,
-      reason: `GPU detected (${Math.floor(gpu.totalMemoryMB / 1024)} GB), but no bundled NIM models fit`,
+      reason: `GPU detected (${Math.floor(gpu.totalMemoryMB / 1024)} GB), but no bundled NIM models match the GPU/disk profile`,
     };
   }
 
@@ -187,7 +187,7 @@ function getCompatibleNimModels() {
   if (!gpu || !gpu.nimCapable) {
     return [];
   }
-  return listNimModels().filter((model) => model.minGpuMemoryMB <= gpu.totalMemoryMB);
+  return getCompatibleModels(gpu, gpu.freeDiskGB ?? null);
 }
 
 function showConfig(config: NemoClawOnboardConfig, logger: PluginLogger): void {
@@ -438,8 +438,8 @@ export async function cliOnboard(opts: OnboardOptions): Promise<void> {
       endpointType === "ollama"
         ? getOllamaModelOptions(runCapture).map((id) => ({ label: id, value: id }))
         : endpointType === "nim-local"
-          ? getCompatibleNimModels().map((nimModel) => ({
-              label: `${nimModel.name} (min ${String(Math.floor(nimModel.minGpuMemoryMB / 1024))} GB VRAM)`,
+        ? getCompatibleNimModels().map((nimModel) => ({
+              label: `${nimModel.name}${nimModel.recommendedFor?.length ? ` [${nimModel.recommendedFor.join(", ")}]` : ""}`,
               value: nimModel.name,
             }))
         : validation.models.map((id) => ({ label: id, value: id }));
@@ -459,12 +459,7 @@ export async function cliOnboard(opts: OnboardOptions): Promise<void> {
             ),
           )
         : endpointType === "nim-local"
-          ? Math.max(
-              0,
-              discoveredModelOptions.findIndex(
-                (option) => option.value === "nvidia/nemotron-3-nano-30b-a3b",
-              ),
-            )
+          ? 0
         : 0;
     const modelOptions =
       curatedCloudOptions.length > 0
@@ -529,10 +524,10 @@ export async function cliOnboard(opts: OnboardOptions): Promise<void> {
       return;
     }
 
-    const supportedModels = listNimModels().filter((nimModel) => nimModel.minGpuMemoryMB <= gpu.totalMemoryMB);
+    const supportedModels = getCompatibleModels(gpu, gpu.freeDiskGB ?? null);
     if (!supportedModels.some((nimModel) => nimModel.name === model)) {
       logger.error(
-        `Selected model '${model}' does not fit the detected GPU (${String(Math.floor(gpu.totalMemoryMB / 1024))} GB VRAM).`,
+        `Selected model '${model}' does not match the detected GPU/disk profile (${String(Math.floor(gpu.totalMemoryMB / 1024))} GB VRAM${gpu.freeDiskGB ? `, ${String(gpu.freeDiskGB)} GB free disk` : ""}).`,
       );
       return;
     }

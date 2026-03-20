@@ -618,10 +618,9 @@ async function setupNim(sandboxName, gpu) {
     }
 
     if (selected.key === "nim") {
-      // List models that fit GPU VRAM
-      const models = nim.listModels().filter((m) => m.minGpuMemoryMB <= gpu.totalMemoryMB);
+      const models = nim.getCompatibleModels(gpu, gpu.freeDiskGB ?? null);
       if (models.length === 0) {
-        console.log("  No NIM models fit your GPU VRAM. Falling back to cloud API.");
+        console.log("  No bundled NIM models match the detected GPU/disk profile. Falling back to cloud API.");
       } else {
         let sel;
         if (isNonInteractive()) {
@@ -637,9 +636,10 @@ async function setupNim(sandboxName, gpu) {
           console.log(`  [non-interactive] NIM model: ${sel.name}`);
         } else {
           console.log("");
-          console.log("  Models that fit your GPU:");
+          console.log("  Recommended NIM models for this machine:");
           models.forEach((m, i) => {
-            console.log(`    ${i + 1}) ${m.name} (min ${m.minGpuMemoryMB} MB)`);
+            const tags = (m.recommendedFor || []).join(", ");
+            console.log(`    ${i + 1}) ${m.name}${tags ? ` [${tags}]` : ""}`);
           });
           console.log("");
 

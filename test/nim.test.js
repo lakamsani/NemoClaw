@@ -9,16 +9,18 @@ const nim = require("../bin/lib/nim");
 
 describe("nim", () => {
   describe("listModels", () => {
-    it("returns 5 models", () => {
-      assert.equal(nim.listModels().length, 5);
+    it("returns the curated local NIM shortlist", () => {
+      assert.equal(nim.listModels().length, 6);
     });
 
-    it("each model has name, image, and minGpuMemoryMB", () => {
+    it("each model has hardware metadata for selection", () => {
       for (const m of nim.listModels()) {
         assert.ok(m.name, "missing name");
         assert.ok(m.image, "missing image");
         assert.ok(typeof m.minGpuMemoryMB === "number", "minGpuMemoryMB should be number");
         assert.ok(m.minGpuMemoryMB > 0, "minGpuMemoryMB should be positive");
+        assert.ok(typeof m.recommendedRank === "number", "recommendedRank should be number");
+        assert.ok(Array.isArray(m.profiles), "profiles should be an array");
       }
     });
   });
@@ -112,6 +114,53 @@ describe("nim", () => {
         assert.equal(gpu.nimCapable, false);
         assert.ok(gpu.name, "apple gpu should have name");
       }
+    });
+  });
+
+  describe("getCompatibleModels", () => {
+    it("prefers the single-GPU nano profile on a 1x L40S class machine", () => {
+      const models = nim.getCompatibleModels(
+        {
+          type: "nvidia",
+          count: 1,
+          totalMemoryMB: 46068,
+          perGpuMB: 46068,
+          family: "l40s",
+          families: ["l40s"],
+          freeDiskGB: 120,
+          nimCapable: true,
+        },
+        120
+      );
+
+      assert.equal(models[0].name, "nvidia/nemotron-3-nano-30b-a3b");
+    });
+
+    it("selects larger multi-GPU models when the machine profile supports them", () => {
+      const models = nim.getCompatibleModels(
+        {
+          type: "nvidia",
+          count: 4,
+          totalMemoryMB: 4 * 81920,
+          perGpuMB: 81920,
+          family: "h100",
+          families: ["h100"],
+          freeDiskGB: 200,
+          nimCapable: true,
+        },
+        200
+      );
+
+      assert.deepEqual(
+        models.map((model) => model.name),
+        [
+          "nvidia/nemotron-3-nano-30b-a3b",
+          "deepseek-ai/deepseek-r1-distill-qwen-32b",
+          "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+          "qwen/qwen3-coder-next",
+          "qwen/qwen3-next-80b-a3b-instruct",
+        ]
+      );
     });
   });
 

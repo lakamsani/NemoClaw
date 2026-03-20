@@ -10,15 +10,32 @@ export interface GpuInfo {
   totalMemoryMB: number;
   perGpuMB: number;
   nimCapable: boolean;
+  family?: string | null;
+  families?: string[];
+  names?: string[];
+  freeDiskGB?: number | null;
   name?: string;
   cores?: number | null;
   spark?: boolean;
+}
+
+export interface NimProfile {
+  gpuFamilies?: string[];
+  minGpuCount?: number;
+  minPerGpuMemoryMB?: number;
+  minDiskSpaceGB?: number;
+  precision?: string;
+  diskSource?: string;
 }
 
 export interface NimModel {
   name: string;
   image: string;
   minGpuMemoryMB: number;
+  servedModel?: string;
+  recommendedRank?: number;
+  recommendedFor?: string[];
+  profiles?: NimProfile[];
 }
 
 export interface NimRuntime {
@@ -31,6 +48,25 @@ const MODEL_PULL_ALIASES: Record<string, string[]> = {
 const MODEL_API_ALIASES: Record<string, string> = {
   "nvidia/nemotron-3-nano-30b-a3b": "nvidia/nemotron-3-nano",
 };
+
+function normalizeGpuFamily(name: string): string | null {
+  const value = name.toLowerCase();
+  if (value.includes("gb10") || value.includes("dgx spark")) return "dgx-spark";
+  if (value.includes("gb200")) return "gb200";
+  if (value.includes("b200")) return "b200";
+  if (value.includes("gh200")) return "gh200";
+  if (value.includes("h200")) return "h200";
+  if (value.includes("h100")) return "h100";
+  if (value.includes("h20")) return "h20";
+  if (value.includes("l40s")) return "l40s";
+  if (value.includes("a10g")) return "a10g";
+  if (value.includes("a100")) return "a100";
+  if (value.includes("rtx 6000 ada")) return "rtx6000-ada";
+  if (value.includes("blackwell server edition")) return "rtx-pro-6000-blackwell";
+  if (value.includes("rtx 5090")) return "rtx5090";
+  if (value.includes("rtx 4090")) return "rtx4090";
+  return null;
+}
 
 export function createNimRuntime(): NimRuntime {
   return {
@@ -96,6 +132,10 @@ export function listModels(): NimModel[] {
     name: model.name,
     image: model.image,
     minGpuMemoryMB: model.minGpuMemoryMB,
+    servedModel: model.servedModel ?? getServedModelForModel(model.name),
+    recommendedRank: model.recommendedRank ?? Number.MAX_SAFE_INTEGER,
+    recommendedFor: model.recommendedFor ?? [],
+    profiles: model.profiles ?? [],
   }));
 }
 
@@ -104,6 +144,10 @@ export function getImageForModel(modelName: string): string | null {
 }
 
 export function detectGpu(runtime: NimRuntime): GpuInfo | null {
+  const nvidiaNames = tryExec(
+    runtime,
+    "nvidia-smi --query-gpu=name --format=csv,noheader,nounits 2>/dev/null",
+  );
   const nvidiaMemory = tryExec(
     runtime,
     "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null",
@@ -114,11 +158,20 @@ export function detectGpu(runtime: NimRuntime): GpuInfo | null {
       .map((line) => parseInt(line.trim(), 10))
       .filter((value) => Number.isFinite(value) && value > 0);
     if (perGpuMB.length > 0) {
+      const names = nvidiaNames
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const families = [...new Set(names.map(normalizeGpuFamily).filter((family): family is string => Boolean(family)))];
       return {
         type: "nvidia",
         count: perGpuMB.length,
         totalMemoryMB: perGpuMB.reduce((sum, value) => sum + value, 0),
         perGpuMB: perGpuMB[0],
+        names,
+        family: families[0] ?? null,
+        families,
+        freeDiskGB: detectDiskSpaceGB(runtime),
         nimCapable: true,
       };
     }
@@ -135,6 +188,10 @@ export function detectGpu(runtime: NimRuntime): GpuInfo | null {
       count: 1,
       totalMemoryMB,
       perGpuMB: totalMemoryMB,
+      names: ["NVIDIA GB10"],
+      family: "dgx-spark",
+      families: ["dgx-spark"],
+      freeDiskGB: detectDiskSpaceGB(runtime),
       nimCapable: true,
       spark: true,
     };
@@ -196,6 +253,53 @@ export function pullNimImage(model: string, runtime: NimRuntime): string {
   throw new Error(
     `Failed to pull a local NIM image for ${model}. Tried: ${candidates.join(", ")}${lastError ? `\n${lastError}` : ""}`,
   );
+}
+
+export function detectDiskSpaceGB(runtime: NimRuntime): number | null {
+  const dockerRoot = tryExec(runtime, "docker info --format '{{.DockerRootDir}}' 2>/dev/null") || "/var/lib/docker";
+  const availableKB = tryExec(runtime, `df -Pk ${shellQuote(dockerRoot)} | awk 'NR==2 {print $4}'`);
+  const available = parseInt(availableKB, 10);
+  if (!Number.isFinite(available) || available <= 0) {
+    return null;
+  }
+  return Math.floor(available / 1024 / 1024);
+}
+
+function profileMatches(profile: NimProfile, gpu: GpuInfo, freeDiskGB: number | null): boolean {
+  if ((profile.gpuFamilies?.length ?? 0) > 0) {
+    const families = gpu.families ?? [];
+    if (!families.some((family) => profile.gpuFamilies?.includes(family))) {
+      return false;
+    }
+  }
+  if ((profile.minGpuCount ?? 1) > gpu.count) {
+    return false;
+  }
+  if ((profile.minPerGpuMemoryMB ?? 0) > gpu.perGpuMB) {
+    return false;
+  }
+  if (freeDiskGB !== null && (profile.minDiskSpaceGB ?? 0) > freeDiskGB) {
+    return false;
+  }
+  return true;
+}
+
+export function getCompatibleModels(gpu: GpuInfo, freeDiskGB: number | null = gpu.freeDiskGB ?? null): NimModel[] {
+  return listModels()
+    .filter((model) => {
+      if ((model.profiles?.length ?? 0) > 0) {
+        return model.profiles?.some((profile) => profileMatches(profile, gpu, freeDiskGB));
+      }
+      return model.minGpuMemoryMB <= gpu.totalMemoryMB;
+    })
+    .sort((left, right) => {
+      const leftRank = left.recommendedRank ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = right.recommendedRank ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return left.minGpuMemoryMB - right.minGpuMemoryMB;
+    });
 }
 
 export function startNimContainer(

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   containerName,
   detectGpu,
+  getCompatibleModels,
   getImageForModel,
   getServedModelForModel,
   listModels,
@@ -62,6 +63,7 @@ describe("nim helpers", () => {
 
   it("detects an nvidia gpu from nvidia-smi memory output", () => {
     const runtime = runtimeWithResponses({
+      "--query-gpu=name": "NVIDIA L40S\nNVIDIA L40S\n",
       "--query-gpu=memory.total": "8192\n8192\n",
     });
     expect(detectGpu(runtime)).toEqual({
@@ -69,6 +71,10 @@ describe("nim helpers", () => {
       count: 2,
       totalMemoryMB: 16384,
       perGpuMB: 8192,
+      names: ["NVIDIA L40S", "NVIDIA L40S"],
+      family: "l40s",
+      families: ["l40s"],
+      freeDiskGB: null,
       nimCapable: true,
     });
   });
@@ -200,5 +206,20 @@ describe("nim helpers", () => {
       "curl -sf http://localhost:8000/v1/models": '{"data":[]}',
     });
     expect(waitForNimHealth(runtime, 8000, 1, 0)).toBe(true);
+  });
+
+  it("returns models compatible with the detected machine profile in recommendation order", () => {
+    expect(
+      getCompatibleModels({
+        type: "nvidia",
+        count: 1,
+        totalMemoryMB: 46068,
+        perGpuMB: 46068,
+        family: "l40s",
+        families: ["l40s"],
+        freeDiskGB: 120,
+        nimCapable: true,
+      }).map((model) => model.name),
+    ).toEqual(["nvidia/nemotron-3-nano-30b-a3b"]);
   });
 });

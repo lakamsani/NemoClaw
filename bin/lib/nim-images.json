@@ -1,29 +1,153 @@
 {
   "models": [
     {
-      "name": "nvidia/nemotron-3-super-120b-a12b",
-      "image": "nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b:latest",
-      "minGpuMemoryMB": 40960
-    },
-    {
       "name": "nvidia/nemotron-3-nano-30b-a3b",
       "image": "nvcr.io/nim/nvidia/nemotron-3-nano-30b-a3b:latest",
-      "minGpuMemoryMB": 8192
+      "servedModel": "nvidia/nemotron-3-nano",
+      "minGpuMemoryMB": 32768,
+      "recommendedRank": 1,
+      "recommendedFor": ["general", "chat", "tool-use"],
+      "profiles": [
+        {
+          "gpuFamilies": ["dgx-spark", "gh200", "h200", "h100", "a100", "l40s", "rtx-pro-6000-blackwell"],
+          "minGpuCount": 1,
+          "minPerGpuMemoryMB": 46000,
+          "minDiskSpaceGB": 32,
+          "precision": "fp8"
+        },
+        {
+          "gpuFamilies": ["a10g"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 24000,
+          "minDiskSpaceGB": 32,
+          "precision": "bf16"
+        }
+      ]
     },
     {
-      "name": "nvidia/llama-3.1-nemotron-70b-instruct",
-      "image": "nvcr.io/nim/nvidia/llama-3.1-nemotron-70b-instruct:latest",
-      "minGpuMemoryMB": 81920
+      "name": "deepseek-ai/deepseek-r1-distill-qwen-32b",
+      "image": "nvcr.io/nim/deepseek-ai/deepseek-r1-distill-qwen-32b:latest",
+      "minGpuMemoryMB": 65536,
+      "recommendedRank": 2,
+      "recommendedFor": ["reasoning", "analysis"],
+      "profiles": [
+        {
+          "gpuFamilies": ["h200", "h100", "h20", "a100"],
+          "minGpuCount": 1,
+          "minPerGpuMemoryMB": 80000,
+          "minDiskSpaceGB": 62,
+          "precision": "bf16"
+        },
+        {
+          "gpuFamilies": ["l40s"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 46000,
+          "minDiskSpaceGB": 33,
+          "precision": "fp8"
+        }
+      ]
     },
     {
-      "name": "nvidia/llama-3.3-nemotron-super-49b-v1",
-      "image": "nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1:latest",
-      "minGpuMemoryMB": 24576
+      "name": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+      "image": "nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5:latest",
+      "minGpuMemoryMB": 92160,
+      "recommendedRank": 3,
+      "recommendedFor": ["general", "tool-use", "quality"],
+      "profiles": [
+        {
+          "gpuFamilies": ["b200", "h200", "gh200"],
+          "minGpuCount": 1,
+          "minPerGpuMemoryMB": 141000,
+          "minDiskSpaceGB": 92,
+          "precision": "fp8"
+        },
+        {
+          "gpuFamilies": ["h100", "rtx-pro-6000-blackwell"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 80000,
+          "minDiskSpaceGB": 92,
+          "precision": "fp8"
+        },
+        {
+          "gpuFamilies": ["a100", "l40s"],
+          "minGpuCount": 4,
+          "minPerGpuMemoryMB": 40000,
+          "minDiskSpaceGB": 92,
+          "precision": "fp8"
+        }
+      ]
     },
     {
-      "name": "meta/llama-3.1-8b-instruct",
-      "image": "nvcr.io/nim/meta/llama-3.1-8b-instruct:latest",
-      "minGpuMemoryMB": 16384
+      "name": "qwen/qwen3-coder-next",
+      "image": "nvcr.io/nim/qwen/qwen3-coder-next:latest",
+      "minGpuMemoryMB": 86016,
+      "recommendedRank": 4,
+      "recommendedFor": ["coding", "tool-use"],
+      "profiles": [
+        {
+          "gpuFamilies": ["b200", "h200", "h20"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 86016,
+          "minDiskSpaceGB": 75,
+          "precision": "fp8"
+        },
+        {
+          "gpuFamilies": ["h100"],
+          "minGpuCount": 4,
+          "minPerGpuMemoryMB": 80000,
+          "minDiskSpaceGB": 75,
+          "precision": "fp8"
+        }
+      ]
+    },
+    {
+      "name": "qwen/qwen3-next-80b-a3b-instruct",
+      "image": "nvcr.io/nim/qwen/qwen3-next-80b-a3b-instruct:latest",
+      "minGpuMemoryMB": 86016,
+      "recommendedRank": 5,
+      "recommendedFor": ["general", "tool-use", "quality"],
+      "profiles": [
+        {
+          "gpuFamilies": ["h200", "h20", "h100", "b200"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 76000,
+          "minDiskSpaceGB": 77,
+          "precision": "fp8"
+        }
+      ]
+    },
+    {
+      "name": "nvidia/nemotron-3-super-120b-a12b",
+      "image": "nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b:latest",
+      "minGpuMemoryMB": 184320,
+      "recommendedRank": 6,
+      "recommendedFor": ["general", "tool-use", "quality"],
+      "profiles": [
+        {
+          "gpuFamilies": ["b200", "gb200", "gh200", "h200"],
+          "minGpuCount": 2,
+          "minPerGpuMemoryMB": 141000,
+          "minDiskSpaceGB": 480,
+          "precision": "bf16",
+          "diskSource": "estimate"
+        },
+        {
+          "gpuFamilies": ["h100", "rtx-pro-6000-blackwell"],
+          "minGpuCount": 4,
+          "minPerGpuMemoryMB": 80000,
+          "minDiskSpaceGB": 480,
+          "precision": "bf16",
+          "diskSource": "estimate"
+        },
+        {
+          "gpuFamilies": ["a100", "l40s"],
+          "minGpuCount": 8,
+          "minPerGpuMemoryMB": 40000,
+          "minDiskSpaceGB": 480,
+          "precision": "bf16",
+          "diskSource": "estimate"
+        }
+      ]
     }
   ]
 }

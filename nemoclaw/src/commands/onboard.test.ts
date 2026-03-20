@@ -61,6 +61,20 @@ vi.mock("../onboard/nim.js", () => ({
       minGpuMemoryMB: 40960,
     },
   ]),
+  getCompatibleModels: vi.fn(() => [
+    {
+      name: "nvidia/nemotron-3-nano-30b-a3b",
+      image: "nvcr.io/nim/nvidia/nemotron-3-nano:latest",
+      minGpuMemoryMB: 32768,
+      recommendedFor: ["general", "chat", "tool-use"],
+    },
+    {
+      name: "nvidia/nemotron-3-super-120b-a12b",
+      image: "nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b:latest",
+      minGpuMemoryMB: 184320,
+      recommendedFor: ["general", "tool-use", "quality"],
+    },
+  ]),
   getServedModelForModel: vi.fn((model: string) =>
     model === "nvidia/nemotron-3-nano-30b-a3b" ? "nvidia/nemotron-3-nano" : model,
   ),
