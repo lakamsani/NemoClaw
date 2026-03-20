@@ -171,6 +171,20 @@ if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
   info "Slack webhook URL injected"
 fi
 
+# GOG_KEYRING_PASSWORD (for headless gog auth in heartbeat)
+GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
+ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+info "GOG_KEYRING_PASSWORD injected"
+
+# Shell profile (.bashrc) — ensures PATH and env are set for all sessions
+ssh_cmd 'cat > /sandbox/.bashrc << "BASHRC"
+# NemoClaw sandbox shell profile
+export PATH="/sandbox/.local/bin:$PATH"
+if [ -f /sandbox/.env ]; then set -a; . /sandbox/.env; set +a; fi
+BASHRC
+chmod 644 /sandbox/.bashrc'
+info "Shell profile (.bashrc) created"
+
 # ── Step 5: Patch OpenClaw config with Anthropic ─────────────────
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-7e4d602a8db8d4ca328c538d293e3ac69f365a2d7db89fbb}"
@@ -221,6 +235,10 @@ info "Cron jobs restored"
 # ── Step 8: Start Slack bridge ───────────────────────────────────
 "$SCRIPT_DIR/start-services.sh" --sandbox "$SANDBOX" 2>&1 | grep -E '\[services\]|┌|│|└'
 info "Services started"
+
+# ── Step 9: Ensure heartbeat cron job exists ─────────────────────
+SSH_CONF="$SSH_CONF" "$SCRIPT_DIR/setup-heartbeat-cron.sh" "$SANDBOX" 2>&1 | grep '\[heartbeat-cron\]' || true
+info "Heartbeat cron job checked"
 
 echo ""
 info "NemoClaw fully operational — sandbox: $SANDBOX"
