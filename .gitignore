@@ -1,3 +1,4 @@
+.env
 node_modules/
 dist/
 !nemoclaw/dist/
@@ -6,3 +7,5 @@ __pycache__/
 *.pyc
 .DS_Store
 docs/_build/
+persist/workspace/memory/
+persist/xurl-*
