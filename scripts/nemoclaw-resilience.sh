@@ -57,6 +57,15 @@ if [ "$ALL_USERS" = "true" ]; then
     USER_GITHUB=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('githubUser',''))")
     USER_NAME=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('slackDisplayName','$uid'))")
 
+    # Sync host Claude OAuth token to per-user cred dir (keeps persist copy fresh)
+    if [ -n "$USER_CRED_DIR" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+      FULL_CRED_DIR="$USER_CRED_DIR"
+      [[ "$FULL_CRED_DIR" != /* ]] && FULL_CRED_DIR="$REPO_DIR/$FULL_CRED_DIR"
+      if [ -f "$FULL_CRED_DIR/claude-credentials.json" ]; then
+        cp "$HOME/.claude/.credentials.json" "$FULL_CRED_DIR/claude-credentials.json"
+      fi
+    fi
+
     echo ""
     echo "================================================================"
     echo "[resilience] Bringing up user: $USER_NAME ($uid) → $USER_SANDBOX"
@@ -267,12 +276,11 @@ chmod 644 /sandbox/.bashrc'
   info "Shell profile (.bashrc) created"
 fi
 
-# ── Step 5: Patch OpenClaw config with Anthropic ─────────────────
+# ── Step 5a: Patch OpenClaw config with Anthropic (if API key available) ──
+GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-7e4d602a8db8d4ca328c538d293e3ac69f365a2d7db89fbb}"
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-7e4d602a8db8d4ca328c538d293e3ac69f365a2d7db89fbb}"
   ssh_cmd "python3 -c \"
 import json, os
-# Patch openclaw.json
 path = os.path.expanduser('~/.openclaw/openclaw.json')
 cfg = json.load(open(path))
 providers = cfg.setdefault('models', {}).setdefault('providers', {})
@@ -280,10 +288,6 @@ if 'anthropic' not in providers:
     providers['anthropic'] = {'baseUrl': 'https://api.anthropic.com/v1', 'api': 'anthropic-messages', 'models': [{'id': 'claude-sonnet-4-6', 'name': 'Claude Sonnet 4.6', 'reasoning': False, 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}, 'contextWindow': 200000, 'maxTokens': 64000}]}
 providers['anthropic']['apiKey'] = '${ANTHROPIC_API_KEY}'
 cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
-# Gateway auth token for Control UI
-gw = cfg.setdefault('gateway', {})
-gw['auth'] = {'mode': 'token', 'token': '${GATEWAY_TOKEN}'}
-gw['controlUi'] = {'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True, 'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']}
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
 
@@ -299,6 +303,49 @@ os.chmod(apath, 0o600)
 else
   warn "No ANTHROPIC_API_KEY — OpenClaw will use default Nemotron model"
 fi
+
+# ── Step 5b: Gateway auth, device pairing, and start (always runs) ──
+# Patch gateway auth token + controlUi settings
+ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(path))
+gw = cfg.setdefault('gateway', {})
+gw['auth'] = {'mode': 'token', 'token': '${GATEWAY_TOKEN}'}
+gw['controlUi'] = {'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True, 'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']}
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+info "Gateway auth token set"
+
+# Restore device pairing (required for CLI → gateway communication)
+PAIRED_FILE="$REPO_DIR/persist/gateway/paired.json"
+if [ -f "$PAIRED_FILE" ]; then
+  ssh_cmd 'mkdir -p /sandbox/.openclaw/devices'
+  base64 "$PAIRED_FILE" | ssh_cmd 'base64 -d > /sandbox/.openclaw/devices/paired.json && chmod 600 /sandbox/.openclaw/devices/paired.json'
+  info "Device pairing restored"
+fi
+
+# Kill any existing gateway, then start fresh
+ssh_cmd 'export HOME=/sandbox; node -e "
+const fs = require(\"fs\");
+const dirs = fs.readdirSync(\"/proc\").filter(d => /^\\d+\$/.test(d));
+for (const pid of dirs) {
+  try {
+    const cmd = fs.readFileSync(\"/proc/\" + pid + \"/cmdline\", \"utf8\");
+    if (cmd.includes(\"gateway\") && cmd.includes(\"openclaw\")) {
+      process.kill(Number(pid), 9);
+    }
+  } catch(e) {}
+}
+"' 2>/dev/null || true
+sleep 2
+# Start gateway in a separate SSH session that stays alive
+ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
+  'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null &
+sleep 5
+ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null || true
+info "Gateway started"
 
 # ── Step 6: Restore workspace personality files ──────────────────
 # Try per-user workspace first, then fall back to default

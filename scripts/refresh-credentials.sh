@@ -79,6 +79,33 @@ if p:
 \"" 2>/dev/null
   fi
 
+  # Restore device pairing (required for CLI → gateway communication)
+  PAIRED_FILE="$REPO_DIR/persist/gateway/paired.json"
+  if [ -f "$PAIRED_FILE" ]; then
+    ssh_cmd 'mkdir -p /sandbox/.openclaw/devices'
+    base64 "$PAIRED_FILE" | ssh_cmd 'base64 -d > /sandbox/.openclaw/devices/paired.json && chmod 600 /sandbox/.openclaw/devices/paired.json'
+  fi
+
+  # Restart gateway so it picks up the new token (it caches apiKey in memory)
+  ssh_cmd 'export HOME=/sandbox; node -e "
+const fs = require(\"fs\");
+const dirs = fs.readdirSync(\"/proc\").filter(d => /^\\d+\$/.test(d));
+for (const pid of dirs) {
+  try {
+    const cmd = fs.readFileSync(\"/proc/\" + pid + \"/cmdline\", \"utf8\");
+    if (cmd.includes(\"gateway\") && cmd.includes(\"openclaw\")) {
+      process.kill(Number(pid), 9);
+    }
+  } catch(e) {}
+}
+"' 2>/dev/null || true
+  sleep 2
+  # Start gateway in a separate SSH session that stays alive
+  ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
+    'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null &
+  sleep 5
+  ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null || true
+
   echo "[refresh] Claude credentials updated for $SANDBOX from $CLAUDE_CREDS ($(date))"
 fi
 

@@ -1,21 +1,17 @@
 # USER.md - About Your Human
 
-- **Name:** Vamsee
-- **What to call them:** Vamsee
-- **GitHub:** lakamsani
-- **Email:** lakamsani@gmail.com
-- **Timezone:** US Pacific (PDT, UTC-7)
+_Learn about the person you're helping. Update this as you go._
+
+- **Name:**
+- **What to call them:**
+- **Pronouns:** _(optional)_
+- **Timezone:**
+- **Notes:**
 
 ## Context
 
-- Runs NemoClaw on a DGX Spark (aarch64, headless — no browser)
-- Uses Claude Teams for AI work
-- Integrates with GitHub, Google Workspace (Gmail, Calendar, Drive, Docs), Slack, and X/Twitter
-- Currently building out this agent setup and exploring what it can do
+_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
 
-## Preferences
+---
 
-- Short, direct answers over verbose explanations
-- Action over discussion — just do it, then report back
-- When something breaks, diagnose and fix it rather than listing possible causes
-- Technically deep — understands infra, APIs, and agent systems. No hand-holding needed.
+The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
