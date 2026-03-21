@@ -391,7 +391,9 @@ info "Cron jobs restored"
 info "Services started"
 
 # ── Step 9: Ensure heartbeat cron job exists ─────────────────────
-SSH_CONF="$SSH_CONF" "$SCRIPT_DIR/setup-heartbeat-cron.sh" "$SANDBOX" 2>&1 | grep '\[heartbeat-cron\]' || true
+HEARTBEAT_FLAGS=""
+[ -n "$SLACK_USER_ID" ] && HEARTBEAT_FLAGS="--slack-user-id $SLACK_USER_ID"
+SSH_CONF="$SSH_CONF" "$SCRIPT_DIR/setup-heartbeat-cron.sh" "$SANDBOX" $HEARTBEAT_FLAGS 2>&1 | grep '\[heartbeat-cron\]' || true
 info "Heartbeat cron job checked"
 
 echo ""

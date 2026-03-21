@@ -4,10 +4,12 @@
 #
 # Create the OpenClaw heartbeat cron job inside a sandbox.
 # Idempotent — skips if heartbeat job already exists.
+# Reads heartbeat prompt from per-user HEARTBEAT.md; skips if empty/comments-only.
 #
 # Usage:
 #   ./scripts/setup-heartbeat-cron.sh [sandbox-name]
 #   SSH_CONF=/tmp/ssh-config-foo ./scripts/setup-heartbeat-cron.sh foo
+#   ./scripts/setup-heartbeat-cron.sh foo --slack-user-id U09R681EPQ9
 
 set -euo pipefail
 
@@ -18,7 +20,23 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
-SANDBOX="${1:-${NEMOCLAW_SANDBOX:-veyonce-claw}}"
+SANDBOX=""
+SLACK_USER_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --slack-user-id) SLACK_USER_ID="${2:?--slack-user-id requires a value}"; shift 2 ;;
+    -*) shift ;;
+    *)
+      if [ -z "$SANDBOX" ]; then
+        SANDBOX="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+SANDBOX="${SANDBOX:-${NEMOCLAW_SANDBOX:-veyonce-claw}}"
 SSH_CONF="${SSH_CONF:-/tmp/ssh-config-${SANDBOX}}"
 
 # Generate SSH config if not present
@@ -29,6 +47,37 @@ fi
 ssh_cmd() {
   ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" "$@"
 }
+
+# ── Resolve heartbeat prompt from per-user HEARTBEAT.md ──────────
+HEARTBEAT_MSG=""
+
+# Try per-user file first (requires SLACK_USER_ID)
+if [ -n "$SLACK_USER_ID" ]; then
+  HB_FILE="$REPO_DIR/persist/users/$SLACK_USER_ID/workspace/HEARTBEAT.md"
+  if [ -f "$HB_FILE" ]; then
+    # Strip comment lines and blank lines, check if anything remains
+    CONTENT="$(grep -v '^\s*#' "$HB_FILE" | grep -v '^\s*$' || true)"
+    if [ -n "$CONTENT" ]; then
+      HEARTBEAT_MSG="$CONTENT"
+    fi
+  fi
+fi
+
+# Fallback: try sandbox-level default (legacy)
+if [ -z "$HEARTBEAT_MSG" ] && [ -z "$SLACK_USER_ID" ]; then
+  HB_FILE="$REPO_DIR/persist/workspace/HEARTBEAT.md"
+  if [ -f "$HB_FILE" ]; then
+    CONTENT="$(grep -v '^\s*#' "$HB_FILE" | grep -v '^\s*$' || true)"
+    if [ -n "$CONTENT" ]; then
+      HEARTBEAT_MSG="$CONTENT"
+    fi
+  fi
+fi
+
+if [ -z "$HEARTBEAT_MSG" ]; then
+  echo "[heartbeat-cron] No heartbeat prompt found for $SANDBOX (HEARTBEAT.md empty or missing), skipping"
+  exit 0
+fi
 
 # Check if heartbeat cron already exists
 if ssh_cmd 'export HOME=/sandbox; openclaw cron list 2>/dev/null | grep -q heartbeat'; then
@@ -49,31 +98,6 @@ for i in $(seq 1 15); do
   sleep 2
 done
 
-# Create heartbeat cron job
-read -r -d '' HEARTBEAT_MSG << 'HEARTBEAT_EOF' || true
-You are a personal assistant for Vamsee (timezone: US Pacific / PDT, UTC-7).
-IMPORTANT: The sandbox runs in UTC. Calendar events show PDT times (-07:00). Convert to compare with current time correctly.
-
-Run these steps in order:
-
-Step 1: Source environment and get current time in Pacific.
-Run: set -a && source /sandbox/.env && set +a && export PATH=/sandbox/.local/bin:$PATH && TZ=America/Los_Angeles date
-
-Step 2: Check Gmail for important unread emails.
-Run: gog gmail list -a lakamsani@gmail.com "is:unread" --max 10
-If any look important (from real people, not promo/spam/newsletters), note them.
-
-Step 3: Check Calendar for upcoming events in next 30 minutes.
-Run: gog calendar events -a lakamsani@gmail.com --today --max 10
-Compare event start times against the CURRENT Pacific time from Step 1. If any event starts within 30 minutes from now, note it.
-
-Step 4: If you found important emails or upcoming events, send a Slack notification for each:
-Run: slack-notify "<your message>"
-This DMs the user directly via the Slack bot. Falls back to webhook if configured.
-
-If nothing needs attention, reply HEARTBEAT_OK.
-HEARTBEAT_EOF
-
 # Write message to temp file, copy to sandbox, create cron from there
 TMPFILE="$(mktemp)"
 echo "$HEARTBEAT_MSG" > "$TMPFILE"
@@ -90,4 +114,4 @@ ssh_cmd 'export HOME=/sandbox; openclaw cron add \
   --no-deliver \
   2>&1 && rm -f /tmp/heartbeat-msg.txt'
 
-echo "[heartbeat-cron] Heartbeat cron job created (every 30m)"
+echo "[heartbeat-cron] Heartbeat cron job created (every 30m) for $SANDBOX"
