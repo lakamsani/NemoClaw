@@ -141,8 +141,15 @@ do_start() {
 
   # Slack bridge (only if both tokens provided)
   if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_APP_TOKEN:-}" ]; then
-    SANDBOX_NAME="$SANDBOX_NAME" ALLOWED_USERS="${ALLOWED_USERS:-}" start_service slack-bridge \
-      node "$REPO_DIR/scripts/slack-bridge.js"
+    # Use multi-user bridge if users.json exists with registered users
+    USERS_FILE="$HOME/.nemoclaw/users.json"
+    if [ -f "$USERS_FILE" ] && python3 -c "import json; d=json.load(open('$USERS_FILE')); exit(0 if len(d.get('users',{})) > 0 else 1)" 2>/dev/null; then
+      start_service slack-bridge \
+        node "$REPO_DIR/scripts/slack-bridge-multi.js"
+    else
+      SANDBOX_NAME="$SANDBOX_NAME" ALLOWED_USERS="${ALLOWED_USERS:-}" start_service slack-bridge \
+        node "$REPO_DIR/scripts/slack-bridge.js"
+    fi
   fi
 
   # Print banner

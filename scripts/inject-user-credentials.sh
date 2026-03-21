@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copy per-user credentials from host into a NemoClaw sandbox.
+# Parameterized version of inject-credentials.sh for multi-user support.
+#
+# Usage:
+#   ./scripts/inject-user-credentials.sh <sandbox-name> <cred-dir> [--github-user <user>] [--slack-user-id <id>]
+#
+# Example:
+#   ./scripts/inject-user-credentials.sh veyonce-claw persist/users/U09R681EPQ9/credentials --github-user lakamsani --slack-user-id U09R681EPQ9
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a; . "$REPO_DIR/.env"; set +a
+fi
+
+SANDBOX="${1:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir> [--github-user <user>]}"
+CRED_DIR="${2:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir>}"
+shift 2
+
+# Resolve relative cred dir to absolute
+if [[ "$CRED_DIR" != /* ]]; then
+  CRED_DIR="$REPO_DIR/$CRED_DIR"
+fi
+
+GITHUB_USER=""
+GITHUB_EMAIL=""
+SLACK_USER_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --github-user) GITHUB_USER="${2:?--github-user requires a value}"; shift 2 ;;
+    --github-email) GITHUB_EMAIL="${2:?--github-email requires a value}"; shift 2 ;;
+    --slack-user-id) SLACK_USER_ID="${2:?--slack-user-id requires a value}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# Default email from github user
+if [ -n "$GITHUB_USER" ] && [ -z "$GITHUB_EMAIL" ]; then
+  GITHUB_EMAIL="${GITHUB_USER}@users.noreply.github.com"
+fi
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[inject]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[inject]${NC} $1"; }
+fail()  { echo -e "${RED}[inject]${NC} $1"; exit 1; }
+
+SSH_CONF="/tmp/ssh-config-${SANDBOX}"
+openshell sandbox ssh-config "$SANDBOX" > "$SSH_CONF" 2>/dev/null || fail "Cannot get SSH config for $SANDBOX"
+
+ssh_cmd() {
+  ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no "openshell-${SANDBOX}" "$@"
+}
+
+# Ensure target directories exist
+ssh_cmd 'mkdir -p /sandbox/.claude /sandbox/.config/gh'
+
+# ── Anthropic API key (per-user, for Anthropic models + Claude Code) ──
+if [ -f "$CRED_DIR/anthropic-key.txt" ]; then
+  ANTHROPIC_KEY="$(cat "$CRED_DIR/anthropic-key.txt")"
+  ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${ANTHROPIC_KEY}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${ANTHROPIC_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "Anthropic API key injected (per-user)"
+fi
+
+# ── Claude Code credentials ──────────────────────────────────────
+if [ -f "$CRED_DIR/claude-credentials.json" ]; then
+  base64 "$CRED_DIR/claude-credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+  info "Claude credentials injected"
+elif [ -f "$HOME/.claude/.credentials.json" ]; then
+  base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+  info "Claude credentials injected (from host default)"
+else
+  warn "No Claude credentials found"
+fi
+
+# Claude settings
+if [ -f "$CRED_DIR/claude-settings.json" ]; then
+  base64 "$CRED_DIR/claude-settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
+  info "Claude settings injected"
+elif [ -f "$HOME/.claude/settings.json" ]; then
+  base64 "$HOME/.claude/settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
+  info "Claude settings injected (from host default)"
+fi
+
+# ── Claude MCP auth cache ────────────────────────────────────────
+if [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
+  base64 "$CRED_DIR/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
+  info "Claude MCP auth cache injected"
+elif [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
+  base64 "$HOME/.claude/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
+  info "Claude MCP auth cache injected (from host default)"
+fi
+
+# ── GitHub token ─────────────────────────────────────────────────
+GH_TOKEN=""
+if [ -f "$CRED_DIR/gh-hosts.yml" ]; then
+  base64 "$CRED_DIR/gh-hosts.yml" | ssh_cmd 'mkdir -p /sandbox/.config/gh && base64 -d > /sandbox/.config/gh/hosts.yml && chmod 600 /sandbox/.config/gh/hosts.yml'
+  info "GitHub token injected (from user credentials)"
+else
+  # Fall back to host gh CLI token
+  if command -v gh > /dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+  fi
+  if [ -n "$GH_TOKEN" ]; then
+    GH_USER="${GITHUB_USER:-lakamsani}"
+    ssh_cmd "cat > /sandbox/.config/gh/hosts.yml" <<EOF
+github.com:
+  oauth_token: ${GH_TOKEN}
+  user: ${GH_USER}
+  git_protocol: https
+EOF
+    ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
+    info "GitHub token injected (from host gh CLI)"
+  else
+    warn "No GitHub token available"
+  fi
+fi
+
+# ── Google service account ───────────────────────────────────────
+GOOGLE_SA_PATH="$CRED_DIR/service-account.json"
+if [ ! -f "$GOOGLE_SA_PATH" ]; then
+  GOOGLE_SA_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/lakmsani-gmail-service-account.json}"
+fi
+if [ -f "$GOOGLE_SA_PATH" ]; then
+  ssh_cmd 'mkdir -p /sandbox/.config/gcloud'
+  base64 "$GOOGLE_SA_PATH" | ssh_cmd 'base64 -d > /sandbox/.config/gcloud/service-account.json && chmod 600 /sandbox/.config/gcloud/service-account.json'
+  info "Google service account injected"
+fi
+
+# ── gog CLI (Google OAuth) credentials ───────────────────────────
+GOG_DIR="$CRED_DIR/gogcli"
+if [ ! -d "$GOG_DIR" ]; then
+  GOG_DIR="$HOME/.config/gogcli"
+fi
+if [ -d "$GOG_DIR" ]; then
+  cd "$GOG_DIR" && tar czf - . | ssh_cmd 'mkdir -p /sandbox/.config/gogcli && tar xzf - -C /sandbox/.config/gogcli && chmod -R 700 /sandbox/.config/gogcli'
+  cd "$REPO_DIR"
+  info "gog OAuth credentials injected"
+else
+  warn "No gog config found — Google OAuth tools won't work"
+fi
+
+# ── User-specific .env values ────────────────────────────────────
+# GOG keyring password
+GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
+if [ -f "$CRED_DIR/../.env" ]; then
+  set -a; . "$CRED_DIR/../.env"; set +a
+  GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-$GOG_KEYRING_PW}"
+fi
+ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+info "GOG_KEYRING_PASSWORD injected"
+
+# Slack webhook URL (optional fallback for heartbeat notifications)
+if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+  ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "Slack webhook URL injected"
+fi
+
+# Slack bot token (for DM-based heartbeat notifications — preferred over webhook)
+if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+  ssh_cmd "grep -q SLACK_BOT_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_BOT_TOKEN=.*|SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}|' /sandbox/.env || echo 'SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "Slack bot token injected"
+fi
+
+# Slack user ID (so heartbeat can DM the right user)
+if [ -n "$SLACK_USER_ID" ]; then
+  ssh_cmd "grep -q SLACK_USER_ID /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_USER_ID=.*|SLACK_USER_ID=${SLACK_USER_ID}|' /sandbox/.env || echo 'SLACK_USER_ID=${SLACK_USER_ID}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "Slack user ID injected ($SLACK_USER_ID)"
+fi
+
+# slack-notify helper script (DM via bot token, fallback to webhook)
+NOTIFY_SCRIPT="$SCRIPT_DIR/slack-notify.sh"
+if [ -f "$NOTIFY_SCRIPT" ]; then
+  base64 "$NOTIFY_SCRIPT" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/slack-notify && chmod +x /sandbox/.local/bin/slack-notify'
+  info "slack-notify helper installed"
+fi
+
+# ── xurl (X/Twitter) ────────────────────────────────────────────
+XURL_BIN="$REPO_DIR/persist/xurl-linux-arm64"
+if [ -f "$XURL_BIN" ]; then
+  base64 "$XURL_BIN" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/xurl && chmod +x /sandbox/.local/bin/xurl'
+  info "xurl binary injected"
+fi
+
+TWITTER_CREDS="${TWITTER_CREDS_PATH:-$HOME/twitter-claw.txt}"
+if [ -f "$CRED_DIR/twitter-creds.txt" ]; then
+  TWITTER_CREDS="$CRED_DIR/twitter-creds.txt"
+fi
+if [ -f "$TWITTER_CREDS" ]; then
+  set -a; . "$TWITTER_CREDS"; set +a
+  ssh_cmd "export PATH='/sandbox/.local/bin:\$PATH' && \
+    python3 -c \"import os; f=os.path.expanduser('~/.xurl'); os.path.exists(f) and os.remove(f)\" 2>/dev/null; \
+    xurl auth apps add nemoclaw --client-id '${X_API_KEY}' --client-secret '${X_API_KEY_SECRET}' 2>/dev/null; \
+    xurl auth oauth1 --consumer-key '${X_API_KEY}' --consumer-secret '${X_API_KEY_SECRET}' --access-token '${X_ACCESS_TOKEN}' --token-secret '${X_ACCESS_TOKEN_SECRET}' 2>/dev/null; \
+    xurl auth app --bearer-token '${X_BEARER_TOKEN}' 2>/dev/null; \
+    xurl auth default default 2>/dev/null" 2>&1 | grep -v '^\[' || true
+  info "xurl (X/Twitter) credentials configured"
+fi
+
+# ── Git config ───────────────────────────────────────────────────
+if [ -n "$GITHUB_USER" ]; then
+  ssh_cmd "git config --global user.name '${GITHUB_USER}' && git config --global user.email '${GITHUB_EMAIL}'" 2>/dev/null
+  info "Git config set (user: $GITHUB_USER)"
+fi
+
+# ── Shell profile ────────────────────────────────────────────────
+ssh_cmd 'cat > /sandbox/.bashrc << "BASHRC"
+# NemoClaw sandbox shell profile
+export PATH="/sandbox/.local/bin:$PATH"
+if [ -f /sandbox/.env ]; then set -a; . /sandbox/.env; set +a; fi
+BASHRC
+chmod 644 /sandbox/.bashrc'
+info "Shell profile created"
+
+echo ""
+info "Credential injection complete for sandbox '${SANDBOX}'"

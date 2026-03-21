@@ -18,8 +18,8 @@ RUN groupadd -r sandbox && useradd -r -g sandbox -d /sandbox -s /bin/bash sandbo
 # Install OpenClaw CLI
 RUN npm install -g openclaw@2026.3.11
 
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code CLI (pin version for reproducible builds)
+RUN npm install -g @anthropic-ai/claude-code@2.1.81
 
 # Install GitHub CLI (gh)
 RUN ARCH=$(dpkg --print-architecture) && \

@@ -15,6 +15,7 @@ const {
   isRepoPrivate,
 } = require("./lib/credentials");
 const registry = require("./lib/registry");
+const userReg = require("./lib/user-registry");
 const nim = require("./lib/nim");
 const policies = require("./lib/policies");
 
@@ -23,6 +24,7 @@ const policies = require("./lib/policies");
 const GLOBAL_COMMANDS = new Set([
   "onboard", "list", "deploy", "setup", "setup-spark",
   "start", "stop", "status", "uninstall",
+  "user-add", "user-remove", "user-list", "user-status",
   "help", "--help", "-h",
 ]);
 
@@ -240,19 +242,275 @@ function listSandboxes() {
     return;
   }
 
+  // Build user-to-sandbox lookup
+  const { users } = userReg.listUsers();
+  const sandboxUserMap = {};
+  for (const u of users) {
+    sandboxUserMap[u.sandboxName] = u.slackDisplayName || u.slackUserId;
+  }
+
   console.log("");
   console.log("  Sandboxes:");
   for (const sb of sandboxes) {
     const def = sb.name === defaultSandbox ? " *" : "";
+    const owner = sandboxUserMap[sb.name] || "-";
     const model = sb.model || "unknown";
     const provider = sb.provider || "unknown";
     const gpu = sb.gpuEnabled ? "GPU" : "CPU";
     const presets = sb.policies && sb.policies.length > 0 ? sb.policies.join(", ") : "none";
-    console.log(`    ${sb.name}${def}`);
-    console.log(`      model: ${model}  provider: ${provider}  ${gpu}  policies: ${presets}`);
+    console.log(`    ${owner.padEnd(12)} ${sb.name}${def}`);
+    console.log(`${"".padEnd(17)}model: ${model}  provider: ${provider}  ${gpu}  policies: ${presets}`);
   }
   console.log("");
   console.log("  * = default sandbox");
+  console.log("");
+}
+
+// ── User lifecycle commands ──────────────────────────────────────
+
+async function userAdd() {
+  const { prompt: askPrompt } = require("./lib/credentials");
+
+  console.log("");
+  console.log("  NemoClaw — Register a new user");
+  console.log("");
+
+  const slackUserId = await askPrompt("  Slack user ID (e.g. U09R681EPQ9): ");
+  if (!slackUserId || !/^U[A-Z0-9]+$/.test(slackUserId)) {
+    console.error("  Invalid Slack user ID. Must start with U followed by alphanumeric characters.");
+    process.exit(1);
+  }
+
+  const existing = userReg.getUser(slackUserId);
+  if (existing) {
+    console.error(`  User ${slackUserId} already registered (sandbox: ${existing.sandboxName}).`);
+    console.error("  Run 'nemoclaw user-remove " + slackUserId + "' first to re-register.");
+    process.exit(1);
+  }
+
+  const slackDisplayName = await askPrompt("  Slack display name: ");
+  const sandboxName = await askPrompt("  Sandbox name (e.g. alice-claw): ");
+  if (!sandboxName || !/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(sandboxName)) {
+    console.error("  Invalid sandbox name. Use lowercase letters, numbers, and hyphens.");
+    process.exit(1);
+  }
+
+  const githubUser = await askPrompt("  GitHub username (optional, press Enter to skip): ");
+
+  // Check if sandbox exists or needs to be created
+  const sbExists = registry.getSandbox(sandboxName);
+  if (!sbExists) {
+    const create = await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
+    if (create.toLowerCase() !== "n") {
+      console.log(`  Creating sandbox '${sandboxName}' (this may take a few minutes on first run)...`);
+
+      // Stage build context (same as onboard flow)
+      const { mkdtempSync } = require("fs");
+      const buildCtx = mkdtempSync(path.join(os.tmpdir(), "nemoclaw-build-"));
+      fs.copyFileSync(path.join(ROOT, "Dockerfile"), path.join(buildCtx, "Dockerfile"));
+      execSync(`cp -r "${path.join(ROOT, "nemoclaw")}" "${buildCtx}/nemoclaw"`, { stdio: "inherit" });
+      execSync(`cp -r "${path.join(ROOT, "nemoclaw-blueprint")}" "${buildCtx}/nemoclaw-blueprint"`, { stdio: "inherit" });
+      execSync(`cp -r "${path.join(ROOT, "scripts")}" "${buildCtx}/scripts"`, { stdio: "inherit" });
+      execSync(`rm -rf "${buildCtx}/nemoclaw/node_modules" "${buildCtx}/nemoclaw/src"`, { stdio: "ignore" });
+
+      const basePolicyPath = path.join(ROOT, "nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml");
+      const envArgs = [];
+      if (process.env.NVIDIA_API_KEY) envArgs.push(`NVIDIA_API_KEY=${process.env.NVIDIA_API_KEY}`);
+
+      try {
+        execSync(
+          `openshell sandbox create --from "${buildCtx}/Dockerfile" --name "${sandboxName}" --policy "${basePolicyPath}" -- env ${envArgs.join(" ")} nemoclaw-start 2>&1`,
+          { stdio: "inherit", timeout: 300000 }
+        );
+      } catch (err) {
+        console.error(`  Failed to create sandbox: ${err.message}`);
+        execSync(`rm -rf "${buildCtx}"`, { stdio: "ignore" });
+        process.exit(1);
+      }
+      execSync(`rm -rf "${buildCtx}"`, { stdio: "ignore" });
+
+      registry.registerSandbox({
+        name: sandboxName,
+        model: "anthropic/claude-sonnet-4-6",
+        provider: "openshell",
+        gpuEnabled: false,
+        policies: [],
+      });
+      console.log(`  Sandbox '${sandboxName}' created and registered.`);
+
+      // Apply default policy presets (matching veyonce-claw: npm, pypi, slack)
+      const policies = require("./lib/policies");
+      const defaultPresets = ["npm", "pypi", "slack"];
+      const allPresets = policies.listPresets();
+      const knownNames = new Set(allPresets.map((p) => p.name));
+
+      console.log("");
+      console.log("  Available policy presets:");
+      allPresets.forEach((p) => {
+        const suggested = defaultPresets.includes(p.name) ? " (default)" : "";
+        console.log(`    ○ ${p.name} — ${p.description}${suggested}`);
+      });
+      console.log("");
+
+      const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
+
+      let selectedPresets = defaultPresets;
+      if (presetAnswer.toLowerCase() === "n") {
+        selectedPresets = [];
+        console.log("  Skipping policy presets.");
+      } else if (presetAnswer.toLowerCase() === "list") {
+        const picks = await askPrompt("  Enter preset names (comma-separated): ");
+        selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
+        const invalid = selectedPresets.filter((n) => !knownNames.has(n));
+        if (invalid.length > 0) {
+          console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
+          selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
+        }
+      }
+
+      for (const preset of selectedPresets) {
+        try {
+          policies.applyPreset(sandboxName, preset);
+        } catch (err) {
+          console.error(`  Warning: failed to apply preset '${preset}': ${err.message}`);
+        }
+      }
+      if (selectedPresets.length > 0) {
+        console.log(`  Applied presets: ${selectedPresets.join(", ")}`);
+      }
+    }
+  }
+
+  // Create per-user persist directories
+  const persistBase = `persist/users/${slackUserId}`;
+  const credDir = `${persistBase}/credentials`;
+  const workspaceDir = `${persistBase}/workspace`;
+  fs.mkdirSync(path.join(ROOT, credDir), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(ROOT, workspaceDir), { recursive: true });
+
+  // Copy default personality files if workspace is empty
+  const defaultWorkspace = path.join(ROOT, "persist", "workspace");
+  const userWorkspace = path.join(ROOT, workspaceDir);
+  if (fs.existsSync(defaultWorkspace)) {
+    const files = ["SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "AGENTS.md", "BOOTSTRAP.md"];
+    for (const f of files) {
+      const src = path.join(defaultWorkspace, f);
+      const dst = path.join(userWorkspace, f);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        fs.copyFileSync(src, dst);
+      }
+    }
+    console.log("  Default personality files copied to user workspace.");
+  }
+
+  // Register user
+  userReg.registerUser({
+    slackUserId,
+    slackDisplayName,
+    sandboxName,
+    githubUser,
+    personalityDir: workspaceDir,
+    credentialsDir: credDir,
+    enabled: true,
+  });
+
+  console.log("");
+  console.log(`  User registered:`);
+  console.log(`    Slack ID:    ${slackUserId}`);
+  console.log(`    Name:        ${slackDisplayName}`);
+  console.log(`    Sandbox:     ${sandboxName}`);
+  console.log(`    GitHub:      ${githubUser || "(none)"}`);
+  console.log(`    Credentials: ${credDir}`);
+  console.log(`    Workspace:   ${workspaceDir}`);
+  console.log("");
+  console.log("  Next steps:");
+  console.log(`    1. Place credentials in ${credDir}/`);
+  console.log("       (claude-credentials.json, gh-hosts.yml, gogcli/)");
+  console.log(`    2. Customize personality in ${workspaceDir}/`);
+  console.log(`    3. Run: scripts/inject-user-credentials.sh ${sandboxName} ${credDir}` + (githubUser ? ` --github-user ${githubUser}` : ""));
+  console.log("");
+}
+
+function userRemove(slackUserId) {
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw user-remove <slack-user-id>");
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  Removing user: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox: ${user.sandboxName}`);
+
+  userReg.removeUser(slackUserId);
+  console.log(`  User removed from registry.`);
+  console.log("");
+  console.log("  Note: Sandbox and persist files were NOT deleted.");
+  console.log(`  To also destroy the sandbox: nemoclaw ${user.sandboxName} destroy`);
+  console.log(`  To delete user data: rm -rf persist/users/${slackUserId}`);
+  console.log("");
+}
+
+function userList() {
+  const { users, defaultUser } = userReg.listUsers();
+  if (users.length === 0) {
+    console.log("");
+    console.log("  No users registered. Run 'nemoclaw user-add' to get started.");
+    console.log("");
+    return;
+  }
+
+  console.log("");
+  console.log("  Registered Users:");
+  for (const u of users) {
+    const def = u.slackUserId === defaultUser ? " *" : "";
+    const status = u.enabled ? "enabled" : "disabled";
+    console.log(`    ${u.slackDisplayName || u.slackUserId}${def}`);
+    console.log(`      slack: ${u.slackUserId}  sandbox: ${u.sandboxName}  github: ${u.githubUser || "-"}  ${status}`);
+  }
+  console.log("");
+  console.log("  * = default user");
+  console.log("");
+}
+
+function userStatus(slackUserId) {
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw user-status <slack-user-id>");
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox:     ${user.sandboxName}`);
+  console.log(`    GitHub:      ${user.githubUser || "-"}`);
+  console.log(`    Enabled:     ${user.enabled}`);
+  console.log(`    Credentials: ${user.credentialsDir}`);
+  console.log(`    Workspace:   ${user.personalityDir}`);
+  console.log(`    Created:     ${user.createdAt}`);
+
+  // Check sandbox health
+  try {
+    const out = execSync(`openshell sandbox list 2>&1`, { encoding: "utf-8" });
+    if (out.includes(user.sandboxName)) {
+      const ready = out.includes(`${user.sandboxName}`) && out.includes("Ready");
+      console.log(`    Sandbox:     ${ready ? "Ready" : "Not Ready"}`);
+    } else {
+      console.log("    Sandbox:     Not found (not created?)");
+    }
+  } catch {
+    console.log("    Sandbox:     (cannot check — openshell not available)");
+  }
   console.log("");
 }
 
@@ -360,6 +618,12 @@ function help() {
     nemoclaw <name> policy-add       Add a policy preset to a sandbox
     nemoclaw <name> policy-list      List presets (● = applied)
 
+  Multi-User:
+    nemoclaw user-add                Register a new user (interactive wizard)
+    nemoclaw user-remove <slack-id>  Remove a user from registry
+    nemoclaw user-list               List all registered users
+    nemoclaw user-status <slack-id>  Show user details and sandbox health
+
   Deploy:
     nemoclaw deploy <instance>       Deploy to a Brev VM and start services
 
@@ -402,6 +666,10 @@ const [cmd, ...args] = process.argv.slice(2);
       case "status":      showStatus(); break;
       case "uninstall":   uninstall(args); break;
       case "list":        listSandboxes(); break;
+      case "user-add":    await userAdd(); break;
+      case "user-remove": userRemove(args[0]); break;
+      case "user-list":   userList(); break;
+      case "user-status": userStatus(args[0]); break;
       default:            help(); break;
     }
     return;

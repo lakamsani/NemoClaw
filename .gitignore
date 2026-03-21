@@ -9,3 +9,4 @@ __pycache__/
 docs/_build/
 persist/workspace/memory/
 persist/xurl-*
+persist/users/*/credentials/

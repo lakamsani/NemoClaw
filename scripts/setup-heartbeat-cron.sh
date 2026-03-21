@@ -68,7 +68,8 @@ Run: gog calendar events -a lakamsani@gmail.com --today --max 10
 Compare event start times against the CURRENT Pacific time from Step 1. If any event starts within 30 minutes from now, note it.
 
 Step 4: If you found important emails or upcoming events, send a Slack notification for each:
-Run: echo '{"text":"<your message>"}' | curl -s -X POST -H 'Content-Type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+Run: slack-notify "<your message>"
+This DMs the user directly via the Slack bot. Falls back to webhook if configured.
 
 If nothing needs attention, reply HEARTBEAT_OK.
 HEARTBEAT_EOF

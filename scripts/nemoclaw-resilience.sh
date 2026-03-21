@@ -10,6 +10,8 @@
 # Usage:
 #   ./scripts/nemoclaw-resilience.sh
 #   ./scripts/nemoclaw-resilience.sh --sandbox veyonce-claw
+#   ./scripts/nemoclaw-resilience.sh --all                    # All registered users
+#   ./scripts/nemoclaw-resilience.sh --sandbox X --cred-dir persist/users/U.../credentials --github-user alice
 
 set -euo pipefail
 
@@ -22,14 +24,56 @@ if [ -f "$REPO_DIR/.env" ]; then
 fi
 
 SANDBOX="${NEMOCLAW_SANDBOX:-veyonce-claw}"
+CRED_DIR=""
+GITHUB_USER=""
+SLACK_USER_ID=""
+ALL_USERS=false
 
 # Parse args
 while [ $# -gt 0 ]; do
   case "$1" in
     --sandbox) SANDBOX="${2:?--sandbox requires a name}"; shift 2 ;;
+    --cred-dir) CRED_DIR="${2:?--cred-dir requires a path}"; shift 2 ;;
+    --github-user) GITHUB_USER="${2:?--github-user requires a name}"; shift 2 ;;
+    --slack-user-id) SLACK_USER_ID="${2:?--slack-user-id requires a value}"; shift 2 ;;
+    --all) ALL_USERS=true; shift ;;
     *) shift ;;
   esac
 done
+
+# ── --all mode: iterate over all registered users ─────────────────
+if [ "$ALL_USERS" = "true" ]; then
+  USERS_FILE="$HOME/.nemoclaw/users.json"
+  if [ ! -f "$USERS_FILE" ]; then
+    echo "[resilience] No users.json found at $USERS_FILE"
+    exit 1
+  fi
+
+  USER_IDS=$(python3 -c "import json; d=json.load(open('$USERS_FILE')); [print(uid) for uid, u in d.get('users',{}).items() if u.get('enabled', True)]")
+
+  for uid in $USER_IDS; do
+    USER_SANDBOX=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid']['sandboxName'])")
+    USER_CRED_DIR=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid']['credentialsDir'])")
+    USER_GITHUB=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('githubUser',''))")
+    USER_NAME=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('slackDisplayName','$uid'))")
+
+    echo ""
+    echo "================================================================"
+    echo "[resilience] Bringing up user: $USER_NAME ($uid) → $USER_SANDBOX"
+    echo "================================================================"
+
+    GITHUB_FLAG=""
+    [ -n "$USER_GITHUB" ] && GITHUB_FLAG="--github-user $USER_GITHUB"
+
+    "$0" --sandbox "$USER_SANDBOX" --cred-dir "$USER_CRED_DIR" --slack-user-id "$uid" $GITHUB_FLAG || {
+      echo "[resilience] FAILED for user $USER_NAME ($USER_SANDBOX) — continuing..."
+    }
+  done
+
+  echo ""
+  echo "[resilience] All users processed."
+  exit 0
+fi
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -68,7 +112,7 @@ ssh_cmd() {
 # ── Step 3: Apply merged network policy ──────────────────────────
 POLICY_DIR="$REPO_DIR/nemoclaw-blueprint/policies"
 PRESETS=()
-for preset in google.yaml xcurl.yaml slack.yaml; do
+for preset in google.yaml xcurl.yaml slack.yaml npm.yaml pypi.yaml; do
   [ -f "$POLICY_DIR/presets/$preset" ] && PRESETS+=("$POLICY_DIR/presets/$preset")
 done
 
@@ -81,109 +125,147 @@ openshell policy set --policy /tmp/nemoclaw-merged-policy.yaml "$SANDBOX" 2>&1 |
 info "Network policy applied"
 
 # ── Step 4: Inject credentials ───────────────────────────────────
-# Claude credentials (base64 over SSH — sftp is broken in sandbox)
-if [ -f "$HOME/.claude/.credentials.json" ]; then
-  ssh_cmd 'mkdir -p /sandbox/.claude'
-  base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  info "Claude credentials injected"
+if [ -n "$CRED_DIR" ]; then
+  # Multi-user mode: use per-user credential injection script
+  GITHUB_FLAG=""
+  [ -n "$GITHUB_USER" ] && GITHUB_FLAG="--github-user $GITHUB_USER"
+  SLACK_FLAG=""
+  [ -n "$SLACK_USER_ID" ] && SLACK_FLAG="--slack-user-id $SLACK_USER_ID"
+  "$SCRIPT_DIR/inject-user-credentials.sh" "$SANDBOX" "$CRED_DIR" $GITHUB_FLAG $SLACK_FLAG
+  info "Per-user credentials injected via inject-user-credentials.sh"
 
   # Extract ANTHROPIC_API_KEY for openclaw config
-  ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  if [ -n "$CRED_DIR" ] && [[ "$CRED_DIR" == /* ]]; then
+    CRED_ABS="$CRED_DIR"
+  else
+    CRED_ABS="$REPO_DIR/$CRED_DIR"
+  fi
+  if [ -f "$CRED_ABS/claude-credentials.json" ]; then
+    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CRED_ABS/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  elif [ -f "$HOME/.claude/.credentials.json" ]; then
+    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  fi
 else
-  warn "No Claude credentials at ~/.claude/.credentials.json"
-fi
+  # Legacy single-user mode: inject from host defaults
+  # Claude credentials (base64 over SSH — sftp is broken in sandbox)
+  if [ -f "$HOME/.claude/.credentials.json" ]; then
+    ssh_cmd 'mkdir -p /sandbox/.claude'
+    base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+    info "Claude credentials injected"
 
-# Claude MCP auth cache
-if [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
-  base64 "$HOME/.claude/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
-  info "Claude MCP auth cache injected"
-fi
+    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  else
+    warn "No Claude credentials at ~/.claude/.credentials.json"
+  fi
 
-# Claude settings
-if [ -f "$HOME/.claude/settings.json" ]; then
-  base64 "$HOME/.claude/settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
-  info "Claude settings injected"
-fi
+  # Claude MCP auth cache
+  if [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
+    base64 "$HOME/.claude/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
+    info "Claude MCP auth cache injected"
+  fi
 
-# GitHub token
-GH_TOKEN="${GH_TOKEN:-}"
-if [ -z "$GH_TOKEN" ] && command -v gh > /dev/null 2>&1; then
-  GH_TOKEN="$(gh auth token 2>/dev/null || true)"
-fi
-if [ -n "$GH_TOKEN" ]; then
-  ssh_cmd "mkdir -p /sandbox/.config/gh && cat > /sandbox/.config/gh/hosts.yml" <<GHEOF
+  # Claude settings
+  if [ -f "$HOME/.claude/settings.json" ]; then
+    base64 "$HOME/.claude/settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
+    info "Claude settings injected"
+  fi
+
+  # GitHub token
+  GH_TOKEN="${GH_TOKEN:-}"
+  if [ -z "$GH_TOKEN" ] && command -v gh > /dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+  fi
+  if [ -n "$GH_TOKEN" ]; then
+    ssh_cmd "mkdir -p /sandbox/.config/gh && cat > /sandbox/.config/gh/hosts.yml" <<GHEOF
 github.com:
   oauth_token: ${GH_TOKEN}
   user: lakamsani
   git_protocol: https
 GHEOF
-  ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
-  info "GitHub token injected"
-else
-  warn "No GitHub token available"
-fi
+    ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
+    info "GitHub token injected"
+  else
+    warn "No GitHub token available"
+  fi
 
-# Google service account
-GOOGLE_SA_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/lakmsani-gmail-service-account.json}"
-if [ -f "$GOOGLE_SA_PATH" ]; then
-  ssh_cmd 'mkdir -p /sandbox/.config/gcloud'
-  base64 "$GOOGLE_SA_PATH" | ssh_cmd 'base64 -d > /sandbox/.config/gcloud/service-account.json && chmod 600 /sandbox/.config/gcloud/service-account.json'
-  info "Google service account injected"
-fi
+  # Google service account
+  GOOGLE_SA_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/lakmsani-gmail-service-account.json}"
+  if [ -f "$GOOGLE_SA_PATH" ]; then
+    ssh_cmd 'mkdir -p /sandbox/.config/gcloud'
+    base64 "$GOOGLE_SA_PATH" | ssh_cmd 'base64 -d > /sandbox/.config/gcloud/service-account.json && chmod 600 /sandbox/.config/gcloud/service-account.json'
+    info "Google service account injected"
+  fi
 
-# gog OAuth credentials
-if [ -d "$HOME/.config/gogcli" ]; then
-  cd "$HOME/.config/gogcli" && tar czf - . | ssh_cmd 'mkdir -p /sandbox/.config/gogcli && tar xzf - -C /sandbox/.config/gogcli && chmod -R 700 /sandbox/.config/gogcli'
-  cd "$REPO_DIR"
-  info "gog OAuth credentials injected"
-fi
+  # gog OAuth credentials
+  if [ -d "$HOME/.config/gogcli" ]; then
+    cd "$HOME/.config/gogcli" && tar czf - . | ssh_cmd 'mkdir -p /sandbox/.config/gogcli && tar xzf - -C /sandbox/.config/gogcli && chmod -R 700 /sandbox/.config/gogcli'
+    cd "$REPO_DIR"
+    info "gog OAuth credentials injected"
+  fi
 
-# xurl config (X/Twitter) — write from twitter-claw.txt tokens via xurl CLI
-XURL_BIN="$REPO_DIR/persist/xurl-linux-arm64"
-if [ -f "$XURL_BIN" ]; then
-  base64 "$XURL_BIN" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/xurl && chmod +x /sandbox/.local/bin/xurl'
-  info "xurl binary injected"
-fi
+  # xurl config (X/Twitter)
+  XURL_BIN="$REPO_DIR/persist/xurl-linux-arm64"
+  if [ -f "$XURL_BIN" ]; then
+    base64 "$XURL_BIN" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/xurl && chmod +x /sandbox/.local/bin/xurl'
+    info "xurl binary injected"
+  fi
 
-TWITTER_CREDS="${TWITTER_CREDS_PATH:-$HOME/twitter-claw.txt}"
-if [ -f "$TWITTER_CREDS" ]; then
-  # Source twitter tokens and configure xurl inside sandbox
-  set -a; . "$TWITTER_CREDS"; set +a
-  ssh_cmd "export PATH='/sandbox/.local/bin:\$PATH' && \
-    python3 -c \"import os; f=os.path.expanduser('~/.xurl'); os.path.exists(f) and os.remove(f)\" 2>/dev/null; \
-    xurl auth apps add nemoclaw --client-id '${X_API_KEY}' --client-secret '${X_API_KEY_SECRET}' 2>/dev/null; \
-    xurl auth oauth1 --consumer-key '${X_API_KEY}' --consumer-secret '${X_API_KEY_SECRET}' --access-token '${X_ACCESS_TOKEN}' --token-secret '${X_ACCESS_TOKEN_SECRET}' 2>/dev/null; \
-    xurl auth app --bearer-token '${X_BEARER_TOKEN}' 2>/dev/null; \
-    xurl auth default default 2>/dev/null" 2>&1 | grep -v '^\[' || true
-  info "xurl (X/Twitter) credentials configured"
-else
-  warn "No twitter credentials at $TWITTER_CREDS"
-fi
+  TWITTER_CREDS="${TWITTER_CREDS_PATH:-$HOME/twitter-claw.txt}"
+  if [ -f "$TWITTER_CREDS" ]; then
+    set -a; . "$TWITTER_CREDS"; set +a
+    ssh_cmd "export PATH='/sandbox/.local/bin:\$PATH' && \
+      python3 -c \"import os; f=os.path.expanduser('~/.xurl'); os.path.exists(f) and os.remove(f)\" 2>/dev/null; \
+      xurl auth apps add nemoclaw --client-id '${X_API_KEY}' --client-secret '${X_API_KEY_SECRET}' 2>/dev/null; \
+      xurl auth oauth1 --consumer-key '${X_API_KEY}' --consumer-secret '${X_API_KEY_SECRET}' --access-token '${X_ACCESS_TOKEN}' --token-secret '${X_ACCESS_TOKEN_SECRET}' 2>/dev/null; \
+      xurl auth app --bearer-token '${X_BEARER_TOKEN}' 2>/dev/null; \
+      xurl auth default default 2>/dev/null" 2>&1 | grep -v '^\[' || true
+    info "xurl (X/Twitter) credentials configured"
+  else
+    warn "No twitter credentials at $TWITTER_CREDS"
+  fi
 
-# Git config
-ssh_cmd 'git config --global user.name "lakamsani" && git config --global user.email "lakamsani@users.noreply.github.com"' 2>/dev/null
-info "Git config set"
+  # Git config
+  ssh_cmd 'git config --global user.name "lakamsani" && git config --global user.email "lakamsani@users.noreply.github.com"' 2>/dev/null
+  info "Git config set"
 
-# Slack webhook URL (for heartbeat notifications)
-if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-  ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}' >> /sandbox/.env"
-  ssh_cmd 'chmod 600 /sandbox/.env'
-  info "Slack webhook URL injected"
-fi
+  # Slack webhook URL (fallback for heartbeat)
+  if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+    ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}' >> /sandbox/.env"
+    ssh_cmd 'chmod 600 /sandbox/.env'
+    info "Slack webhook URL injected"
+  fi
 
-# GOG_KEYRING_PASSWORD (for headless gog auth in heartbeat)
-GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
-ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
-info "GOG_KEYRING_PASSWORD injected"
+  # Slack bot token + user ID (for DM-based heartbeat notifications)
+  if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+    ssh_cmd "grep -q SLACK_BOT_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_BOT_TOKEN=.*|SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}|' /sandbox/.env || echo 'SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+    info "Slack bot token injected"
+  fi
+  if [ -n "$SLACK_USER_ID" ]; then
+    ssh_cmd "grep -q SLACK_USER_ID /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_USER_ID=.*|SLACK_USER_ID=${SLACK_USER_ID}|' /sandbox/.env || echo 'SLACK_USER_ID=${SLACK_USER_ID}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+    info "Slack user ID injected ($SLACK_USER_ID)"
+  fi
 
-# Shell profile (.bashrc) — ensures PATH and env are set for all sessions
-ssh_cmd 'cat > /sandbox/.bashrc << "BASHRC"
+  # slack-notify helper script
+  NOTIFY_SCRIPT="$SCRIPT_DIR/slack-notify.sh"
+  if [ -f "$NOTIFY_SCRIPT" ]; then
+    base64 "$NOTIFY_SCRIPT" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/slack-notify && chmod +x /sandbox/.local/bin/slack-notify'
+    info "slack-notify helper installed"
+  fi
+
+  # GOG_KEYRING_PASSWORD
+  GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
+  ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "GOG_KEYRING_PASSWORD injected"
+
+  # Shell profile (.bashrc)
+  ssh_cmd 'cat > /sandbox/.bashrc << "BASHRC"
 # NemoClaw sandbox shell profile
 export PATH="/sandbox/.local/bin:$PATH"
 if [ -f /sandbox/.env ]; then set -a; . /sandbox/.env; set +a; fi
 BASHRC
 chmod 644 /sandbox/.bashrc'
-info "Shell profile (.bashrc) created"
+  info "Shell profile (.bashrc) created"
+fi
 
 # ── Step 5: Patch OpenClaw config with Anthropic ─────────────────
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -219,13 +301,38 @@ else
 fi
 
 # ── Step 6: Restore workspace personality files ──────────────────
-PERSIST_DIR="$REPO_DIR/persist/workspace"
+# Try per-user workspace first, then fall back to default
+PERSIST_DIR=""
+if [ -n "$CRED_DIR" ]; then
+  # Derive workspace dir from cred dir (sibling directory)
+  if [[ "$CRED_DIR" == /* ]]; then
+    PERSIST_DIR="$(dirname "$CRED_DIR")/workspace"
+  else
+    PERSIST_DIR="$REPO_DIR/$(dirname "$CRED_DIR")/workspace"
+  fi
+fi
+if [ -z "$PERSIST_DIR" ] || [ ! -d "$PERSIST_DIR" ]; then
+  PERSIST_DIR="$REPO_DIR/persist/workspace"
+fi
+
 if [ -d "$PERSIST_DIR" ] && [ -f "$PERSIST_DIR/SOUL.md" ]; then
   cd "$PERSIST_DIR" && tar czf - . | ssh_cmd 'tar xzf - -C /sandbox/.openclaw/workspace/'
   cd "$REPO_DIR"
-  info "Workspace personality files restored"
+  info "Workspace personality files restored from $PERSIST_DIR"
 else
   warn "No workspace backup at $PERSIST_DIR"
+fi
+
+# ── Step 6b: Upgrade Claude Code to latest ─────────────────────
+# Install to /sandbox/.local so it takes priority over the system version
+# (/sandbox/.local/bin is first on PATH via .bashrc).
+CURRENT_CC="$(ssh_cmd 'export PATH="/sandbox/.local/bin:$PATH" && claude --version 2>/dev/null' 2>/dev/null | grep -oP '[\d.]+' | head -1 || true)"
+LATEST_CC="$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)"
+if [ -n "$LATEST_CC" ] && [ "$CURRENT_CC" != "$LATEST_CC" ]; then
+  ssh_cmd "npm install -g --prefix /sandbox/.local @anthropic-ai/claude-code@${LATEST_CC}" 2>&1 | tail -2
+  info "Claude Code upgraded: ${CURRENT_CC:-unknown} → ${LATEST_CC}"
+else
+  info "Claude Code already at latest (${CURRENT_CC:-unknown})"
 fi
 
 # ── Step 7: Restore cron jobs ──────────────────────────────────
