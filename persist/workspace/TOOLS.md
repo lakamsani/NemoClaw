@@ -2,7 +2,7 @@
 
 ## Google Workspace (gog CLI)
 
-- **Account:** lakamsani@gmail.com
+- **Account:** YOUR_EMAIL
 - **Services:** Gmail, Calendar, Drive, Contacts, Docs, Sheets
 - **Binary:** /sandbox/.local/bin/gog
 - **Keyring:** file-based, password in GOG_KEYRING_PASSWORD env var
@@ -10,7 +10,7 @@
 
 ## GitHub (gh CLI)
 
-- **Account:** lakamsani
+- **Account:** YOUR_GITHUB_USER
 - **Binary:** /usr/local/bin/gh
 - **Protocol:** HTTPS
 

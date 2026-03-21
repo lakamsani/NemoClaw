@@ -67,7 +67,7 @@ if [ -n "$GH_TOKEN" ]; then
   ssh_cmd "cat > /sandbox/.config/gh/hosts.yml" <<EOF
 github.com:
   oauth_token: ${GH_TOKEN}
-  user: lakamsani
+  user: ${GH_USER:-$(gh api user --jq .login 2>/dev/null || echo "unknown")}
   git_protocol: https
 EOF
   ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
@@ -117,7 +117,8 @@ ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GO
 info "GOG_KEYRING_PASSWORD injected into /sandbox/.env"
 
 # ── Git config ───────────────────────────────────────────────────
-ssh_cmd 'git config --global user.name "lakamsani" && git config --global user.email "lakamsani@users.noreply.github.com"'
+GH_USER="${GH_USER:-$(gh api user --jq .login 2>/dev/null || echo "user")}"
+ssh_cmd "git config --global user.name \"${GH_USER}\" && git config --global user.email \"${GH_USER}@users.noreply.github.com\""
 info "Git config set"
 
 echo ""

@@ -16,7 +16,7 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
-SANDBOX="${1:-${NEMOCLAW_SANDBOX:-veyonce-claw}}"
+SANDBOX="${1:-${NEMOCLAW_SANDBOX:-my-assistant}}"
 SSH_CONF="/tmp/ssh-config-${SANDBOX}"
 
 # Refresh SSH config

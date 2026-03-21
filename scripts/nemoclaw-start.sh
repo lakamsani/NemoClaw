@@ -225,7 +225,7 @@ inject_github_token() {
     cat > /sandbox/.config/gh/hosts.yml <<GHEOF
 github.com:
   oauth_token: ${GH_TOKEN}
-  user: ${GH_USER:-lakamsani}
+  user: ${GH_USER:-user}
   git_protocol: https
 GHEOF
     chmod 600 /sandbox/.config/gh/hosts.yml

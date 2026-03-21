@@ -12,7 +12,7 @@ Slack App (1 bot, 1 Socket Mode connection)
     ▼
 slack-bridge-multi.js  ◄── user-registry.json (slackUserId → sandboxName)
     │
-    ├── user U09R681EPQ9 → SSH → veyonce-claw (sandbox pod)
+    ├── user UXXXXXXXXXX → SSH → my-assistant (sandbox pod)
     ├── user U12345ABCDE → SSH → alice-claw   (sandbox pod)
     └── user U67890FGHIJ → SSH → bob-claw     (sandbox pod)
 ```
@@ -33,18 +33,18 @@ slack-bridge-multi.js  ◄── user-registry.json (slackUserId → sandboxName
 ```json
 {
   "users": {
-    "U09R681EPQ9": {
-      "slackUserId": "U09R681EPQ9",
-      "slackDisplayName": "vamsee",
-      "sandboxName": "veyonce-claw",
-      "githubUser": "lakamsani",
-      "createdAt": "2026-03-20T00:00:00Z",
-      "personalityDir": "persist/users/U09R681EPQ9/workspace",
-      "credentialsDir": "persist/users/U09R681EPQ9/credentials",
+    "UXXXXXXXXXX": {
+      "slackUserId": "UXXXXXXXXXX",
+      "slackDisplayName": "your-name",
+      "sandboxName": "my-assistant",
+      "githubUser": "your-github-user",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "personalityDir": "persist/users/UXXXXXXXXXX/workspace",
+      "credentialsDir": "persist/users/UXXXXXXXXXX/credentials",
       "enabled": true
     }
   },
-  "defaultUser": "U09R681EPQ9"
+  "defaultUser": "UXXXXXXXXXX"
 }
 ```
 
@@ -72,7 +72,7 @@ persist/users/<slack-user-id>/
 
 - Refactor `scripts/inject-credentials.sh` → `scripts/inject-user-credentials.sh <sandbox-name> <user-credentials-dir>`
 - Every `$HOME/.claude/...` becomes `$CRED_DIR/...`
-- Migrate existing veyonce-claw user data into the new structure
+- Migrate existing my-assistant user data into the new structure
 
 ---
 

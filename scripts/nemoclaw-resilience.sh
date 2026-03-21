@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ./scripts/nemoclaw-resilience.sh
-#   ./scripts/nemoclaw-resilience.sh --sandbox veyonce-claw
+#   ./scripts/nemoclaw-resilience.sh --sandbox my-assistant
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
-SANDBOX="${NEMOCLAW_SANDBOX:-veyonce-claw}"
+SANDBOX="${NEMOCLAW_SANDBOX:-my-assistant}"
 
 # Parse args
 while [ $# -gt 0 ]; do
@@ -114,7 +114,7 @@ if [ -n "$GH_TOKEN" ]; then
   ssh_cmd "mkdir -p /sandbox/.config/gh && cat > /sandbox/.config/gh/hosts.yml" <<GHEOF
 github.com:
   oauth_token: ${GH_TOKEN}
-  user: lakamsani
+  user: ${GH_USER:-user}
   git_protocol: https
 GHEOF
   ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
@@ -161,7 +161,7 @@ else
 fi
 
 # Git config
-ssh_cmd 'git config --global user.name "lakamsani" && git config --global user.email "lakamsani@users.noreply.github.com"' 2>/dev/null
+ssh_cmd "git config --global user.name '${GH_USER:-user}' && git config --global user.email '${GH_USER:-user}@users.noreply.github.com'" 2>/dev/null
 info "Git config set"
 
 # Slack webhook URL (for heartbeat notifications)
@@ -187,7 +187,7 @@ info "Shell profile (.bashrc) created"
 
 # ── Step 5: Patch OpenClaw config with Anthropic ─────────────────
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-7e4d602a8db8d4ca328c538d293e3ac69f365a2d7db89fbb}"
+  GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
   ssh_cmd "python3 -c \"
 import json, os
 # Patch openclaw.json
