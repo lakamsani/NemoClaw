@@ -136,22 +136,52 @@ async function main() {
     }
   }
 
-  // Handle @mentions in channels
+  // Handle @mentions in channels — only allowed channels, ignore bots
   app.event("app_mention", async ({ event, say }) => {
+    if (event.subtype) return;
+    if (event.bot_id) return;
+    if (event.user === botUserId) return;
     await handleMessage(event, say);
   });
 
-  // Handle direct messages
+  // Handle direct messages — only 1:1 DMs, ignore group DMs (mpim)
   app.event("message", async ({ event, say }) => {
     if (event.channel_type !== "im") return;
     if (event.subtype) return;
+    if (event.bot_id) return;
+    if (event.user === botUserId) return;
     await handleMessage(event, say);
   });
 
   async function handleMessage(event, say) {
-    const channel = event.channel;
+    let channel = event.channel;
     const threadTs = event.thread_ts || event.ts;
     const isDM = event.channel_type === "im";
+
+    // Ensure DM channel is open (fixes channel_not_found for new users)
+    if (isDM) {
+      try {
+        const dm = await app.client.conversations.open({
+          token: SLACK_BOT_TOKEN,
+          users: event.user,
+        });
+        if (dm.channel && dm.channel.id) {
+          channel = dm.channel.id;
+        }
+      } catch (e) {
+        console.log(`[warn] conversations.open failed for ${event.user}: ${e.message}`);
+      }
+    }
+
+    // Helper: send message to the resolved channel (avoids channel_not_found)
+    async function reply(text) {
+      await app.client.chat.postMessage({
+        token: SLACK_BOT_TOKEN,
+        channel,
+        thread_ts: threadTs,
+        text,
+      });
+    }
 
     // Channel access control
     if (ALLOWED_CHANNELS && !ALLOWED_CHANNELS.includes(channel)) {
@@ -174,24 +204,18 @@ async function main() {
     if (isSetupCommand(text)) {
       // !setup help is available to everyone
       if (text === "!setup help" || text === "!setup") {
-        await say({ text: setupHelp(), thread_ts: threadTs });
+        await reply(setupHelp());
         return;
       }
 
       // All other !setup commands require DM and registration
       if (!isDM) {
-        await say({
-          text: "For security, `!setup` commands with credentials must be sent as a *direct message* to me, not in a channel.",
-          thread_ts: threadTs,
-        });
+        await reply("For security, `!setup` commands with credentials must be sent as a *direct message* to me, not in a channel.");
         return;
       }
 
       if (!user) {
-        await say({
-          text: "You're not registered yet. Ask an admin to run `nemoclaw user-add` with your Slack user ID first.\nYour Slack ID: `" + event.user + "`",
-          thread_ts: threadTs,
-        });
+        await reply("You're not registered yet. Ask an admin to run `nemoclaw user-add` with your Slack user ID first.\nYour Slack ID: `" + event.user + "`");
         return;
       }
 
@@ -217,17 +241,14 @@ async function main() {
         }
       }
 
-      await say({ text: response, thread_ts: threadTs });
+      await reply(response);
       return;
     }
 
     // ── Normal message routing ─────────────────────────────────
     if (!user) {
       console.log(`[ignored] user ${event.user} not registered`);
-      await say({
-        text: "You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.",
-        thread_ts: threadTs,
-      });
+      await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.");
       return;
     }
 
@@ -242,7 +263,7 @@ async function main() {
         text: "Working on it...",
       });
 
-      const response = await runAgentInSandbox(text, `${channel}-${Date.now()}`, user.sandboxName);
+      const response = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}`, user.sandboxName);
       console.log(`[${channel}] ${user.sandboxName} → ${displayName}: ${response.slice(0, 100)}...`);
 
       await app.client.chat.update({

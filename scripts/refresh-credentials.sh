@@ -7,7 +7,9 @@
 #
 # Usage: ./scripts/refresh-credentials.sh [sandbox-name]
 
-set -euo pipefail
+set -uo pipefail
+# Note: -e intentionally omitted — individual SSH commands may fail transiently
+# (e.g. during gateway restart) and we want to continue refreshing remaining steps.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -79,11 +81,31 @@ if p:
 \"" 2>/dev/null
   fi
 
-  # Restore device pairing (required for CLI → gateway communication)
+  # Ensure gateway auth config is correct before restart
+  GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:?GATEWAY_AUTH_TOKEN must be set}"
+  ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(path))
+gw = cfg.setdefault('gateway', {})
+gw['auth'] = {'mode': 'token', 'token': '${GATEWAY_TOKEN}'}
+gw['controlUi'] = {'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True, 'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']}
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+
+  # Restore device pairing — server-side (gateway) + client-side (CLI identity)
   PAIRED_FILE="$REPO_DIR/persist/gateway/paired.json"
+  IDENTITY_DIR="$REPO_DIR/persist/gateway/identity"
   if [ -f "$PAIRED_FILE" ]; then
     ssh_cmd 'mkdir -p /sandbox/.openclaw/devices'
     base64 "$PAIRED_FILE" | ssh_cmd 'base64 -d > /sandbox/.openclaw/devices/paired.json && chmod 600 /sandbox/.openclaw/devices/paired.json'
+  fi
+  if [ -d "$IDENTITY_DIR" ]; then
+    ssh_cmd 'mkdir -p /sandbox/.openclaw/identity'
+    for f in "$IDENTITY_DIR"/*.json; do
+      [ -f "$f" ] && base64 "$f" | ssh_cmd "base64 -d > /sandbox/.openclaw/identity/$(basename "$f") && chmod 600 /sandbox/.openclaw/identity/$(basename "$f")"
+    done
   fi
 
   # Restart gateway so it picks up the new token (it caches apiKey in memory)
@@ -100,9 +122,13 @@ for (const pid of dirs) {
 }
 "' 2>/dev/null || true
   sleep 2
+  # Remove root-owned cron/session files before gateway restart recreates them
+  ssh_cmd 'find /sandbox/.openclaw/cron /sandbox/.openclaw/agents -user root -delete 2>/dev/null' 2>/dev/null || true
   # Start gateway in a separate SSH session that stays alive
-  ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
-    'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null &
+  # Use nohup + disown so the SSH session survives parent shell exit (e.g. cron)
+  nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
+    'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &
+  disown
   sleep 5
   ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null || true
 

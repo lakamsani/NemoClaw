@@ -7,7 +7,8 @@
 #
 # Usage: ./scripts/refresh-all-credentials.sh
 
-set -euo pipefail
+set -uo pipefail
+# Note: -e intentionally omitted — one sandbox failure must not abort the loop.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

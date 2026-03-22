@@ -24,7 +24,7 @@ const policies = require("./lib/policies");
 const GLOBAL_COMMANDS = new Set([
   "onboard", "list", "deploy", "setup", "setup-spark",
   "start", "stop", "status", "uninstall",
-  "user-add", "user-remove", "user-list", "user-status",
+  "user-add", "user-remove", "user-purge", "user-list", "user-status",
   "help", "--help", "-h",
 ]);
 
@@ -268,14 +268,31 @@ function listSandboxes() {
 
 // ── User lifecycle commands ──────────────────────────────────────
 
-async function userAdd() {
+async function userAdd(args = []) {
   const { prompt: askPrompt } = require("./lib/credentials");
+
+  // Parse --non-interactive mode with named args
+  const nonInteractive = args.includes("--non-interactive");
+  let argSlackId, argDisplayName, argClawName, argGithubUser;
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--slack-id":      argSlackId = args[++i]; break;
+      case "--display-name":  argDisplayName = args[++i]; break;
+      case "--claw-name":     argClawName = args[++i]; break;
+      case "--github-user":   argGithubUser = args[++i]; break;
+    }
+  }
+
+  if (nonInteractive && (!argSlackId || !argDisplayName || !argClawName)) {
+    console.error("  Usage: nemoclaw user-add --non-interactive --slack-id <ID> --display-name <NAME> --claw-name <NAME> [--github-user <USER>]");
+    process.exit(1);
+  }
 
   console.log("");
   console.log("  NemoClaw — Register a new user");
   console.log("");
 
-  const slackUserId = await askPrompt("  Slack user ID (e.g. U09R681EPQ9): ");
+  const slackUserId = nonInteractive ? argSlackId : await askPrompt("  Slack user ID (e.g. U09R681EPQ9): ");
   if (!slackUserId || !/^U[A-Z0-9]+$/.test(slackUserId)) {
     console.error("  Invalid Slack user ID. Must start with U followed by alphanumeric characters.");
     process.exit(1);
@@ -288,19 +305,19 @@ async function userAdd() {
     process.exit(1);
   }
 
-  const slackDisplayName = await askPrompt("  Slack display name: ");
-  const sandboxName = await askPrompt("  Sandbox name (e.g. alice-claw): ");
+  const slackDisplayName = nonInteractive ? argDisplayName : await askPrompt("  Slack display name: ");
+  const sandboxName = nonInteractive ? argClawName : await askPrompt("  Sandbox name (e.g. alice-claw): ");
   if (!sandboxName || !/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(sandboxName)) {
     console.error("  Invalid sandbox name. Use lowercase letters, numbers, and hyphens.");
     process.exit(1);
   }
 
-  const githubUser = await askPrompt("  GitHub username (optional, press Enter to skip): ");
+  const githubUser = nonInteractive ? (argGithubUser || "") : await askPrompt("  GitHub username (optional, press Enter to skip): ");
 
   // Check if sandbox exists or needs to be created
   const sbExists = registry.getSandbox(sandboxName);
   if (!sbExists) {
-    const create = await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
+    const create = nonInteractive ? "y" : await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
     if (create.toLowerCase() !== "n") {
       console.log(`  Creating sandbox '${sandboxName}' (this may take a few minutes on first run)...`);
 
@@ -352,19 +369,23 @@ async function userAdd() {
       });
       console.log("");
 
-      const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
-
       let selectedPresets = defaultPresets;
-      if (presetAnswer.toLowerCase() === "n") {
-        selectedPresets = [];
-        console.log("  Skipping policy presets.");
-      } else if (presetAnswer.toLowerCase() === "list") {
-        const picks = await askPrompt("  Enter preset names (comma-separated): ");
-        selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
-        const invalid = selectedPresets.filter((n) => !knownNames.has(n));
-        if (invalid.length > 0) {
-          console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
-          selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
+      if (nonInteractive) {
+        console.log(`  [non-interactive] Applying default presets: ${defaultPresets.join(", ")}`);
+      } else {
+        const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
+
+        if (presetAnswer.toLowerCase() === "n") {
+          selectedPresets = [];
+          console.log("  Skipping policy presets.");
+        } else if (presetAnswer.toLowerCase() === "list") {
+          const picks = await askPrompt("  Enter preset names (comma-separated): ");
+          selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
+          const invalid = selectedPresets.filter((n) => !knownNames.has(n));
+          if (invalid.length > 0) {
+            console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
+            selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
+          }
         }
       }
 
@@ -453,6 +474,97 @@ function userRemove(slackUserId) {
   console.log("  Note: Sandbox and persist files were NOT deleted.");
   console.log(`  To also destroy the sandbox: nemoclaw ${user.sandboxName} destroy`);
   console.log(`  To delete user data: rm -rf persist/users/${slackUserId}`);
+  console.log("");
+}
+
+function userPurge(args = []) {
+  // Parse arguments: --sandbox <name> or --slack-id <id>
+  let sandboxName, slackUserId;
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--sandbox":  sandboxName = args[++i]; break;
+      case "--slack-id": slackUserId = args[++i]; break;
+    }
+  }
+
+  if (!sandboxName && !slackUserId) {
+    console.error("  Usage: nemoclaw user-purge --sandbox <claw-name>");
+    console.error("         nemoclaw user-purge --slack-id <slack-user-id>");
+    process.exit(1);
+  }
+
+  // Resolve user from whichever identifier was given
+  let user;
+  if (slackUserId) {
+    user = userReg.getUser(slackUserId);
+  } else {
+    user = userReg.getUserBySandbox(sandboxName);
+  }
+
+  if (!user) {
+    // Even without a registry entry, allow purging by sandbox name
+    if (sandboxName) {
+      console.log("");
+      console.log(`  No user found for sandbox '${sandboxName}'. Destroying sandbox only.`);
+      const sb = registry.getSandbox(sandboxName);
+      if (sb) {
+        sandboxDestroy(sandboxName);
+        console.log(`  Sandbox '${sandboxName}' destroyed.`);
+      } else {
+        // Try openshell directly in case it exists but isn't registered
+        try {
+          execSync(`openshell sandbox delete "${sandboxName}" 2>/dev/null`, { stdio: "inherit" });
+          console.log(`  Sandbox '${sandboxName}' deleted via openshell.`);
+        } catch {
+          console.log(`  Sandbox '${sandboxName}' not found in openshell either.`);
+        }
+      }
+      console.log("");
+      return;
+    }
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  slackUserId = user.slackUserId;
+  sandboxName = user.sandboxName;
+
+  console.log("");
+  console.log(`  Purging user: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox:   ${sandboxName}`);
+  console.log("");
+
+  // Step 1: Destroy sandbox (NIM + openshell + sandbox registry)
+  const sb = registry.getSandbox(sandboxName);
+  if (sb) {
+    console.log("  [1/3] Destroying sandbox...");
+    sandboxDestroy(sandboxName);
+  } else {
+    console.log("  [1/3] Sandbox not in registry, attempting openshell delete...");
+    try {
+      execSync(`openshell sandbox delete "${sandboxName}" 2>/dev/null`, { stdio: "inherit" });
+    } catch {
+      console.log(`         Sandbox '${sandboxName}' not found — skipping.`);
+    }
+  }
+
+  // Step 2: Remove from user registry
+  console.log("  [2/3] Removing from user registry...");
+  userReg.removeUser(slackUserId);
+
+  // Step 3: Delete persist data
+  const persistDir = path.join(ROOT, "persist", "users", slackUserId);
+  console.log("  [3/3] Deleting persist data...");
+  if (fs.existsSync(persistDir)) {
+    fs.rmSync(persistDir, { recursive: true, force: true });
+    console.log(`         Removed ${persistDir}`);
+  } else {
+    console.log("         No persist directory found — skipping.");
+  }
+
+  console.log("");
+  console.log(`  User '${user.slackDisplayName}' (${slackUserId}) fully purged.`);
+  console.log("  Note: Restart the Slack bridge to stop routing messages for this user.");
   console.log("");
 }
 
@@ -620,7 +732,9 @@ function help() {
 
   Multi-User:
     nemoclaw user-add                Register a new user (interactive wizard)
-    nemoclaw user-remove <slack-id>  Remove a user from registry
+    nemoclaw user-remove <slack-id>  Remove a user from registry (keeps sandbox/data)
+    nemoclaw user-purge --sandbox <name>  Destroy sandbox + registry + persist data
+    nemoclaw user-purge --slack-id <id>   Same, by Slack user ID
     nemoclaw user-list               List all registered users
     nemoclaw user-status <slack-id>  Show user details and sandbox health
 
@@ -666,8 +780,9 @@ const [cmd, ...args] = process.argv.slice(2);
       case "status":      showStatus(); break;
       case "uninstall":   uninstall(args); break;
       case "list":        listSandboxes(); break;
-      case "user-add":    await userAdd(); break;
+      case "user-add":    await userAdd(args); break;
       case "user-remove": userRemove(args[0]); break;
+      case "user-purge":  userPurge(args); break;
       case "user-list":   userList(); break;
       case "user-status": userStatus(args[0]); break;
       default:            help(); break;

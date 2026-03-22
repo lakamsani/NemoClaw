@@ -277,7 +277,7 @@ chmod 644 /sandbox/.bashrc'
 fi
 
 # ── Step 5a: Patch OpenClaw config with Anthropic (if API key available) ──
-GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:-7e4d602a8db8d4ca328c538d293e3ac69f365a2d7db89fbb}"
+GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:?GATEWAY_AUTH_TOKEN must be set}"
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   ssh_cmd "python3 -c \"
 import json, os
@@ -318,12 +318,20 @@ os.chmod(path, 0o600)
 \"" 2>/dev/null
 info "Gateway auth token set"
 
-# Restore device pairing (required for CLI → gateway communication)
+# Restore device pairing — server-side (gateway) + client-side (CLI identity)
 PAIRED_FILE="$REPO_DIR/persist/gateway/paired.json"
+IDENTITY_DIR="$REPO_DIR/persist/gateway/identity"
 if [ -f "$PAIRED_FILE" ]; then
   ssh_cmd 'mkdir -p /sandbox/.openclaw/devices'
   base64 "$PAIRED_FILE" | ssh_cmd 'base64 -d > /sandbox/.openclaw/devices/paired.json && chmod 600 /sandbox/.openclaw/devices/paired.json'
-  info "Device pairing restored"
+  info "Device pairing restored (server-side)"
+fi
+if [ -d "$IDENTITY_DIR" ]; then
+  ssh_cmd 'mkdir -p /sandbox/.openclaw/identity'
+  for f in "$IDENTITY_DIR"/*.json; do
+    [ -f "$f" ] && base64 "$f" | ssh_cmd "base64 -d > /sandbox/.openclaw/identity/$(basename "$f") && chmod 600 /sandbox/.openclaw/identity/$(basename "$f")"
+  done
+  info "Device identity restored (client-side)"
 fi
 
 # Kill any existing gateway, then start fresh
@@ -340,9 +348,14 @@ for (const pid of dirs) {
 }
 "' 2>/dev/null || true
 sleep 2
+# Remove root-owned cron/session files before gateway restart recreates them
+# (gateway runs as root inside sandbox, creating files sandbox user can't access)
+ssh_cmd 'find /sandbox/.openclaw/cron /sandbox/.openclaw/agents -user root -delete 2>/dev/null' 2>/dev/null || true
 # Start gateway in a separate SSH session that stays alive
-ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
-  'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null &
+# Use nohup + disown so the SSH session survives parent shell exit (e.g. cron)
+nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
+  'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &
+disown
 sleep 5
 ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null || true
 info "Gateway started"
