@@ -121,7 +121,7 @@ ssh_cmd() {
 # ── Step 3: Apply merged network policy ──────────────────────────
 POLICY_DIR="$REPO_DIR/nemoclaw-blueprint/policies"
 PRESETS=()
-for preset in google.yaml xcurl.yaml slack.yaml npm.yaml pypi.yaml; do
+for preset in google.yaml xcurl.yaml slack.yaml npm.yaml pypi.yaml anthropic.yaml; do
   [ -f "$POLICY_DIR/presets/$preset" ] && PRESETS+=("$POLICY_DIR/presets/$preset")
 done
 
@@ -144,15 +144,18 @@ if [ -n "$CRED_DIR" ]; then
   info "Per-user credentials injected via inject-user-credentials.sh"
 
   # Extract ANTHROPIC_API_KEY for openclaw config
-  if [ -n "$CRED_DIR" ] && [[ "$CRED_DIR" == /* ]]; then
-    CRED_ABS="$CRED_DIR"
-  else
-    CRED_ABS="$REPO_DIR/$CRED_DIR"
-  fi
-  if [ -f "$CRED_ABS/claude-credentials.json" ]; then
-    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CRED_ABS/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-  elif [ -f "$HOME/.claude/.credentials.json" ]; then
-    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  # Prefer long-lived setup-token (env var) over expiring OAuth access token
+  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    if [ -n "$CRED_DIR" ] && [[ "$CRED_DIR" == /* ]]; then
+      CRED_ABS="$CRED_DIR"
+    else
+      CRED_ABS="$REPO_DIR/$CRED_DIR"
+    fi
+    if [ -f "$CRED_ABS/claude-credentials.json" ]; then
+      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CRED_ABS/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    elif [ -f "$HOME/.claude/.credentials.json" ]; then
+      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    fi
   fi
 else
   # Legacy single-user mode: inject from host defaults
@@ -162,7 +165,9 @@ else
     base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
     info "Claude credentials injected"
 
-    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    fi
   else
     warn "No Claude credentials at ~/.claude/.credentials.json"
   fi

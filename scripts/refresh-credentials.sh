@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Lightweight credential refresh — re-injects Claude OAuth token and patches
-# ANTHROPIC_API_KEY in openclaw.json. Run on a cron every 4 hours.
+# Lightweight credential refresh — proactively refreshes the Claude OAuth token
+# (if expiring soon) and re-injects it into the sandbox's openclaw.json.
+# Run on a cron every 30 minutes.
 #
 # Usage: ./scripts/refresh-credentials.sh [sandbox-name]
 
@@ -44,6 +45,55 @@ if [ -n "$CRED_DIR" ] && [[ "$CRED_DIR" != /* ]]; then
   CRED_DIR="$REPO_DIR/$CRED_DIR"
 fi
 
+# ── Proactive OAuth token refresh ─────────────────────────────────
+# Check if the host's Claude OAuth access token expires within 90 minutes.
+# If so, run a lightweight `claude -p` command which triggers Claude Code's
+# built-in token refresh, then copy the refreshed credentials to the per-user
+# cred dir (if applicable).
+REFRESH_THRESHOLD_MS=5400000  # 90 minutes in milliseconds
+HOST_CREDS="$HOME/.claude/.credentials.json"
+
+# Only skip OAuth refresh if ANTHROPIC_API_KEY is a real long-lived API key
+# (sk-ant-api...). OAuth access tokens (sk-ant-oat...) expire and need refresh.
+# Any other format (e.g. stale/invalid keys) should not block OAuth refresh.
+IS_LONG_LIVED_KEY=false
+if [ -n "${ANTHROPIC_API_KEY:-}" ] && [[ "${ANTHROPIC_API_KEY}" == sk-ant-api* ]]; then
+  IS_LONG_LIVED_KEY=true
+fi
+
+if [ "$IS_LONG_LIVED_KEY" = "false" ] && [ -f "$HOST_CREDS" ]; then
+  NEEDS_REFRESH=$(python3 -c "
+import json, time, sys
+try:
+    d = json.load(open('$HOST_CREDS'))
+    exp = d.get('claudeAiOauth', {}).get('expiresAt', 0)
+    now = time.time() * 1000
+    remaining = exp - now
+    if remaining < $REFRESH_THRESHOLD_MS:
+        print('yes')
+        sys.exit(0)
+except Exception:
+    pass
+print('no')
+" 2>/dev/null || echo "no")
+
+  if [ "$NEEDS_REFRESH" = "yes" ]; then
+    echo "[refresh] OAuth token expiring soon, triggering refresh via claude CLI... ($(date))"
+    # Run a minimal claude command to trigger the built-in OAuth refresh.
+    # --bare skips hooks/plugins for speed. Timeout after 30s in case of issues.
+    if timeout 30 claude -p "ok" --max-turns 1 --output-format text --bare > /dev/null 2>&1; then
+      echo "[refresh] OAuth token refreshed successfully ($(date))"
+      # Copy refreshed credentials to per-user cred dir
+      if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-credentials.json" ]; then
+        cp "$HOST_CREDS" "$CRED_DIR/claude-credentials.json"
+        echo "[refresh] Synced refreshed token to $CRED_DIR ($(date))"
+      fi
+    else
+      echo "[refresh] WARNING: OAuth token refresh failed — token may expire soon ($(date))"
+    fi
+  fi
+fi
+
 # Refresh SSH config
 openshell sandbox ssh-config "$SANDBOX" > "$SSH_CONF" 2>/dev/null || exit 0
 
@@ -65,10 +115,16 @@ fi
 if [ -n "$CLAUDE_CREDS" ]; then
   base64 "$CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
 
-  # Extract and patch ANTHROPIC_API_KEY
-  ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  # Use long-lived API key if available; otherwise extract fresh OAuth access token
+  if [ "$IS_LONG_LIVED_KEY" = "true" ]; then
+    : # Already set from environment (long-lived API key, not an OAuth token)
+  else
+    # Always read fresh access token from credentials file (may have been refreshed above)
+    ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  fi
 
   if [ -n "$ANTHROPIC_API_KEY" ]; then
+    # Update openclaw.json provider apiKey
     ssh_cmd "python3 -c \"
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -79,6 +135,10 @@ if p:
     json.dump(cfg, open(path, 'w'), indent=2)
     os.chmod(path, 0o600)
 \"" 2>/dev/null
+
+    # Also update ANTHROPIC_API_KEY in sandbox .env — OpenClaw reads env vars
+    # with higher priority than models.json, so both must stay in sync.
+    ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
   fi
 
   # Ensure gateway auth config is correct before restart

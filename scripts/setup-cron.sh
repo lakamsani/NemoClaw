@@ -13,14 +13,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 CRON_ENTRIES=(
-  "# NemoClaw credential refresh — all users (every 1 hour)"
-  "0 */1 * * * $SCRIPT_DIR/refresh-all-credentials.sh >> /tmp/nemoclaw-cred-refresh.log 2>&1"
+  "# NemoClaw credential refresh — all users (every 30 minutes)"
+  "*/30 * * * * $SCRIPT_DIR/refresh-all-credentials.sh >> /tmp/nemoclaw-cred-refresh.log 2>&1"
   "# NemoClaw workspace backup — all users (every 2 hours)"
   "0 */2 * * * $SCRIPT_DIR/backup-all-workspaces.sh >> /tmp/nemoclaw-workspace-backup.log 2>&1"
 )
 
-# Get existing crontab (without NemoClaw entries)
-EXISTING=$(crontab -l 2>/dev/null | grep -v 'NemoClaw\|nemoclaw-cred-refresh\|nemoclaw-workspace-backup\|refresh-credentials\|nemoclaw-backup\|refresh-all\|backup-all' || true)
+# Get existing crontab (without NemoClaw entries or stale env var lines)
+# Note: ANTHROPIC_API_KEY was previously hardcoded in crontab — it should come
+# from .env instead, so the refresh script can manage token lifecycle properly.
+EXISTING=$(crontab -l 2>/dev/null | grep -v 'NemoClaw\|nemoclaw-cred-refresh\|nemoclaw-workspace-backup\|refresh-credentials\|nemoclaw-backup\|refresh-all\|backup-all\|^ANTHROPIC_API_KEY=' || true)
 
 # Build new crontab
 {

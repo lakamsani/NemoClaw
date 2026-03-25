@@ -14,7 +14,7 @@ function load() {
       return JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
     }
   } catch {}
-  return { users: {}, defaultUser: null };
+  return { users: {}, defaultUser: null, deletedUsers: [] };
 }
 
 function save(data) {
@@ -71,6 +71,11 @@ function updateUser(slackUserId, updates) {
 function removeUser(slackUserId) {
   const data = load();
   if (!data.users[slackUserId]) return false;
+  // Track deleted users so the bridge can silently ignore them
+  if (!data.deletedUsers) data.deletedUsers = [];
+  if (!data.deletedUsers.includes(slackUserId)) {
+    data.deletedUsers.push(slackUserId);
+  }
   delete data.users[slackUserId];
   if (data.defaultUser === slackUserId) {
     const remaining = Object.keys(data.users);
@@ -78,6 +83,11 @@ function removeUser(slackUserId) {
   }
   save(data);
   return true;
+}
+
+function isDeletedUser(slackUserId) {
+  const data = load();
+  return (data.deletedUsers || []).includes(slackUserId);
 }
 
 function listUsers() {
@@ -105,6 +115,7 @@ module.exports = {
   registerUser,
   updateUser,
   removeUser,
+  isDeletedUser,
   listUsers,
   setDefault,
 };

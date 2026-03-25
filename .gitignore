@@ -1,3 +1,5 @@
+persist/gateway
+persist/users
 .env
 node_modules/
 dist/

@@ -119,6 +119,7 @@ async function main() {
     token: SLACK_BOT_TOKEN,
     appToken: SLACK_APP_TOKEN,
     socketMode: true,
+    convoStore: false,   // disable built-in conversation store — avoids conversations.info calls
   });
 
   let botUserId = null;
@@ -155,8 +156,8 @@ async function main() {
 
   async function handleMessage(event, say) {
     let channel = event.channel;
-    const threadTs = event.thread_ts || event.ts;
     const isDM = event.channel_type === "im";
+    const threadTs = isDM ? event.thread_ts : (event.thread_ts || event.ts);
 
     // Ensure DM channel is open (fixes channel_not_found for new users)
     if (isDM) {
@@ -247,8 +248,14 @@ async function main() {
 
     // ── Normal message routing ─────────────────────────────────
     if (!user) {
-      console.log(`[ignored] user ${event.user} not registered`);
-      await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.");
+      if (isDM) {
+        // User directly DMed the bot — tell them how to register
+        console.log(`[unregistered] user ${event.user} DMed bot`);
+        await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.");
+      } else {
+        // @mention in a channel — silently ignore, don't send unsolicited messages
+        console.log(`[ignored] user ${event.user} not registered, mentioned bot in channel`);
+      }
       return;
     }
 
