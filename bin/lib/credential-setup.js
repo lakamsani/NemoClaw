@@ -68,7 +68,7 @@ function setupGithub(user, token) {
   // Inject into sandbox
   const b64 = Buffer.from(hostsYml).toString("base64");
   sshPipe(user.sandboxName, b64 + "\n",
-    "base64 -d | tee /sandbox/.config/gh/hosts.yml > /dev/null && chmod 600 /sandbox/.config/gh/hosts.yml");
+    "mkdir -p /sandbox/.config/gh && base64 -d | tee /sandbox/.config/gh/hosts.yml > /dev/null && chmod 600 /sandbox/.config/gh/hosts.yml");
 
   // Set git config
   if (user.githubUser) {
