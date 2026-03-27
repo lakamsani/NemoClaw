@@ -53,6 +53,7 @@ function registerUser(entry) {
     personalityDir: entry.personalityDir || `persist/users/${entry.slackUserId}/workspace`,
     credentialsDir: entry.credentialsDir || `persist/users/${entry.slackUserId}/credentials`,
     enabled: entry.enabled !== undefined ? entry.enabled : true,
+    timezone: entry.timezone || "UTC",
   };
   if (!data.defaultUser) {
     data.defaultUser = entry.slackUserId;

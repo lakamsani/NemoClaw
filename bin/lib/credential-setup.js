@@ -48,6 +48,27 @@ function sshPipe(sandbox, data, remoteCmd) {
   });
 }
 
+// ── Helpers ─────────────────────────────────────────────────────
+
+/**
+ * Try to set up heartbeat cron for a user if they have a HEARTBEAT.md.
+ * Non-fatal — silently skips if prerequisites aren't met.
+ */
+function trySetupHeartbeatCron(user) {
+  try {
+    const scriptPath = path.join(REPO_DIR, "scripts", "setup-heartbeat-cron.sh");
+    if (!fs.existsSync(scriptPath)) return null;
+    const result = execSync(
+      `bash "${scriptPath}" "${user.sandboxName}" --slack-user-id "${user.slackUserId}"`,
+      { encoding: "utf-8", timeout: 60000, env: { ...process.env, SSH_CONF: `/tmp/ssh-config-${user.sandboxName}` } }
+    );
+    if (result.includes("created")) {
+      return "\nHeartbeat cron job auto-configured (every 30m).";
+    }
+  } catch {}
+  return null;
+}
+
 // ── Setup handlers ──────────────────────────────────────────────
 
 function setupGithub(user, token) {
@@ -108,7 +129,7 @@ function setupClaude(user, jsonStr) {
   const accessToken = (parsed.claudeAiOauth || {}).accessToken || "";
   if (accessToken) {
     try {
-      sshCmd(user.sandboxName, `python3 -c "
+      const patchScript = `
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
 if os.path.exists(path):
@@ -118,7 +139,9 @@ if os.path.exists(path):
         p['apiKey'] = '${accessToken}'
         json.dump(cfg, open(path, 'w'), indent=2)
         os.chmod(path, 0o600)
-"`);
+`;
+      const scriptB64 = Buffer.from(patchScript).toString("base64");
+      sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
     } catch {}
   }
 
@@ -156,7 +179,10 @@ function setupGoogle(user, b64Data) {
   sshPipe(user.sandboxName, b64Data + "\n",
     "mkdir -p /sandbox/.config/gogcli && base64 -d | tar xzf - -C /sandbox/.config/gogcli && chmod -R 700 /sandbox/.config/gogcli");
 
-  return `Google (gogcli) credentials saved and injected into sandbox \`${user.sandboxName}\`.`;
+  let msg = `Google (gogcli) credentials saved and injected into sandbox \`${user.sandboxName}\`.`;
+  const hb = trySetupHeartbeatCron(user);
+  if (hb) msg += hb;
+  return msg;
 }
 
 function setupPersonality(user, content) {
@@ -199,7 +225,10 @@ function setupHeartbeat(user, content) {
   sshPipe(user.sandboxName, b64 + "\n",
     "base64 -d > /sandbox/.openclaw/workspace/HEARTBEAT.md");
 
-  return `Heartbeat instructions (HEARTBEAT.md) updated in sandbox \`${user.sandboxName}\`.`;
+  let msg = `Heartbeat instructions (HEARTBEAT.md) updated in sandbox \`${user.sandboxName}\`.`;
+  const hb = trySetupHeartbeatCron(user);
+  if (hb) msg += hb;
+  return msg;
 }
 
 function setupIdentity(user, content) {
@@ -262,7 +291,7 @@ function setupAnthropicKey(user, key) {
 
   // Patch openclaw.json anthropic provider with the key
   try {
-    sshCmd(user.sandboxName, `python3 -c "
+    const patchScript = `
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
 if os.path.exists(path):
@@ -283,11 +312,56 @@ if os.path.exists(path):
     profiles['anthropic:manual'] = {'type': 'api_key', 'provider': 'anthropic', 'keyRef': {'source': 'env', 'id': 'ANTHROPIC_API_KEY'}, 'profileId': 'anthropic:manual'}
     json.dump(profiles, open(apath, 'w'))
     os.chmod(apath, 0o600)
-"`);
+`;
+    const scriptB64 = Buffer.from(patchScript).toString("base64");
+    sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
   } catch {}
 
   return `Anthropic API key saved and injected into sandbox \`${user.sandboxName}\`.\n` +
     "Your agent will use this key for Anthropic models and Claude Code.";
+}
+
+function setupFreshrelease(user, key) {
+  key = key.trim();
+  // Accept code blocks
+  key = key.replace(/^```\s*/m, "").replace(/\s*```$/m, "").trim();
+
+  if (!key) {
+    return "Please provide your Freshrelease API key after the command.\n" +
+      "Example: `!setup freshrelease <your-api-key>`\n" +
+      "Get one from: Freshrelease → Profile → API Key";
+  }
+
+  // Persist to credentials dir
+  const credDir = resolvePath(user.credentialsDir);
+  fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(credDir, "freshrelease-api-key.txt"), key, { mode: 0o600 });
+
+  // Patch Claude settings.json on the sandbox to add/update the Freshrelease MCP server
+  // Use sshPipe + base64 to avoid shell escaping issues with multi-line Python
+  const patchScript = `
+import json, os, sys
+path = '/sandbox/.claude/settings.json'
+if not os.path.exists(path):
+    sys.exit(0)
+cfg = json.load(open(path))
+mcp = cfg.setdefault('mcpServers', {})
+mcp['freshrelease'] = {
+    'command': '/root/.local/bin/uvx',
+    'args': ['freshrelease-mcp'],
+    'env': {
+        'FRESHRELEASE_DOMAIN': 'freshworks.freshrelease.com',
+        'FRESHRELEASE_API_KEY': '${key}'
+    }
+}
+json.dump(cfg, open(path, 'w'), indent=4)
+os.chmod(path, 0o600)
+`;
+  const scriptB64 = Buffer.from(patchScript).toString("base64");
+  sshPipe(user.sandboxName, scriptB64 + "\n",
+    "base64 -d | python3");
+
+  return `Freshrelease API key saved and MCP server configured in sandbox \`${user.sandboxName}\`.`;
 }
 
 function setupWebhook(user, url) {
@@ -296,12 +370,42 @@ function setupWebhook(user, url) {
     return "Invalid webhook URL. Expected a URL starting with `https://hooks.slack.com/`.";
   }
 
+  // Persist to credentials dir
+  const credDir = resolvePath(user.credentialsDir);
+  fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(credDir, "slack-webhook-url.txt"), url, { mode: 0o600 });
+
   // Inject into sandbox .env
   sshCmd(user.sandboxName,
     `grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${url}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${url}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
 
-  return `Slack webhook URL saved and injected into sandbox \`${user.sandboxName}\`.\n` +
+  let msg = `Slack webhook URL saved and injected into sandbox \`${user.sandboxName}\`.\n` +
     "Heartbeat notifications will use this webhook as a fallback if bot DM delivery fails.";
+  const hb = trySetupHeartbeatCron(user);
+  if (hb) msg += hb;
+  return msg;
+}
+
+function setupTimezone(user, tz) {
+  tz = tz.trim();
+  if (!tz) {
+    const current = user.timezone || "UTC";
+    return `Your current timezone is \`${current}\`.\n` +
+      "To change it, provide an IANA timezone name:\n" +
+      "Example: `!setup timezone America/Los_Angeles`\n" +
+      "Common values: `America/New_York`, `America/Chicago`, `America/Los_Angeles`, `Asia/Kolkata`, `Europe/London`, `UTC`";
+  }
+
+  // Basic validation: must look like Area/City or UTC
+  if (tz !== "UTC" && !/^[A-Z][a-z]+\/[A-Z][a-z_]+/.test(tz)) {
+    return `Invalid timezone: \`${tz}\`.\n` +
+      "Use IANA format like `America/Los_Angeles`, `Asia/Kolkata`, or `UTC`.";
+  }
+
+  // Save to user registry
+  userRegistry.updateUser(user.slackUserId, { timezone: tz });
+
+  return `Timezone set to \`${tz}\` for ${user.slackDisplayName}.`;
 }
 
 function setupStatus(user) {
@@ -313,6 +417,7 @@ function setupStatus(user) {
     "Anthropic API key": fs.existsSync(path.join(credDir, "anthropic-key.txt")),
     "GitHub token": fs.existsSync(path.join(credDir, "gh-hosts.yml")),
     "Google OAuth (gogcli)": fs.existsSync(path.join(credDir, "gogcli", "config.json")),
+    "Freshrelease API key": fs.existsSync(path.join(credDir, "freshrelease-api-key.txt")),
     "Personality (SOUL.md)": fs.existsSync(path.join(workspaceDir, "SOUL.md")),
     "Identity (IDENTITY.md)": fs.existsSync(path.join(workspaceDir, "IDENTITY.md")),
     "Heartbeat (HEARTBEAT.md)": fs.existsSync(path.join(workspaceDir, "HEARTBEAT.md")),
@@ -336,6 +441,7 @@ function setupStatus(user) {
   const lines = [
     `*Setup status for ${user.slackDisplayName}*`,
     `Sandbox: \`${user.sandboxName}\` (${sandboxStatus})`,
+    `Timezone: \`${user.timezone || "UTC"}\``,
     "",
   ];
 
@@ -354,17 +460,19 @@ function setupHelp() {
 
 *Credentials* (send via DM only — your message will be deleted after processing):
 • \`!setup github <token>\` — GitHub personal access token (ghp_...)
+• \`!setup freshrelease <key>\` — Freshrelease API key for ticket management MCP
+• \`!setup webhook <url>\` — Slack incoming webhook URL (optional override)
 • \`!setup anthropic-key <key>\` — Anthropic API key (sk-ant-...) for Claude models + coding agent
 • \`!setup claude <json>\` — Paste contents of \`~/.claude/.credentials.json\`
 • \`!setup google <base64>\` — Google OAuth credentials
   _Run on your machine:_ \`cd ~/.config/gogcli && tar czf - . | base64\`
-• \`!setup webhook <url>\` — Slack incoming webhook URL (optional override)
 
 *Personalization* (safe to send in DM or channel):
 • \`!setup personality <text>\` — Set your agent's personality (SOUL.md)
 • \`!setup identity <text>\` — Set your agent's name/role (IDENTITY.md)
 • \`!setup user <text>\` — Tell your agent about yourself (USER.md)
 • \`!setup heartbeat <text>\` — Configure periodic checks (HEARTBEAT.md)
+• \`!setup timezone <tz>\` — Set your timezone (e.g. \`America/Los_Angeles\`, \`Asia/Kolkata\`, \`UTC\`)
 
 *Status:*
 • \`!setup status\` — Check which credentials and files are configured
@@ -378,7 +486,7 @@ _All credential messages are deleted immediately after processing for security._
 
 // ── Main dispatch ───────────────────────────────────────────────
 
-const CREDENTIAL_COMMANDS = new Set(["github", "claude", "google", "webhook", "anthropic-key"]);
+const CREDENTIAL_COMMANDS = new Set(["github", "claude", "google", "webhook", "anthropic-key", "freshrelease"]);
 
 /**
  * Handle a !setup command.
@@ -416,6 +524,10 @@ function handleSetup(user, text) {
         response = setupWebhook(user, arg);
         deleteMessage = true;
         break;
+      case "freshrelease":
+        response = setupFreshrelease(user, arg);
+        deleteMessage = true;
+        break;
       case "personality":
         response = setupPersonality(user, arg);
         break;
@@ -427,6 +539,9 @@ function handleSetup(user, text) {
         break;
       case "heartbeat":
         response = setupHeartbeat(user, arg);
+        break;
+      case "timezone":
+        response = setupTimezone(user, arg);
         break;
       case "status":
         response = setupStatus(user);
@@ -448,14 +563,28 @@ function handleSetup(user, text) {
 }
 
 /**
+ * Normalize text: strip invisible Unicode chars (zero-width spaces, BOM, etc.)
+ * and collapse whitespace. Mobile keyboards (especially on Android/iOS) often
+ * insert these, causing exact string matches to fail.
+ */
+function normalizeText(text) {
+  return text
+    .replace(/[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/g, "") // zero-width / invisible chars
+    .replace(/\u00A0/g, " ") // non-breaking space → regular space
+    .replace(/\s+/g, " ")    // collapse whitespace
+    .trim();
+}
+
+/**
  * Check if text is a !setup command.
  */
 function isSetupCommand(text) {
-  return text.startsWith("!setup");
+  return normalizeText(text).toLowerCase().startsWith("!setup");
 }
 
 module.exports = {
   handleSetup,
   isSetupCommand,
+  normalizeText,
   setupHelp,
 };

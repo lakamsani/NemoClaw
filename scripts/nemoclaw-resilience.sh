@@ -121,7 +121,7 @@ ssh_cmd() {
 # ── Step 3: Apply merged network policy ──────────────────────────
 POLICY_DIR="$REPO_DIR/nemoclaw-blueprint/policies"
 PRESETS=()
-for preset in google.yaml xcurl.yaml slack.yaml npm.yaml pypi.yaml anthropic.yaml; do
+for preset in google.yaml xcurl.yaml slack.yaml npm.yaml pypi.yaml anthropic.yaml freshworks.yaml; do
   [ -f "$POLICY_DIR/presets/$preset" ] && PRESETS+=("$POLICY_DIR/presets/$preset")
 done
 

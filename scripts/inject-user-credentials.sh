@@ -93,6 +93,47 @@ elif [ -f "$HOME/.claude/settings.json" ]; then
   info "Claude settings injected (from host default)"
 fi
 
+# ── Freshrelease MCP server (per-user API key) ───────────────────
+# Patches the Claude settings already on the sandbox with the user's own
+# Freshrelease token. If no per-user key, removes the MCP server entry
+# so the user doesn't get someone else's token from the base settings file.
+if [ -f "$CRED_DIR/freshrelease-api-key.txt" ]; then
+  FR_KEY="$(cat "$CRED_DIR/freshrelease-api-key.txt" | tr -d '[:space:]')"
+  ssh_cmd "python3 -c \"
+import json, os
+path = '/sandbox/.claude/settings.json'
+if not os.path.exists(path):
+    exit(0)
+cfg = json.load(open(path))
+mcp = cfg.setdefault('mcpServers', {})
+mcp['freshrelease'] = {
+    'command': '/root/.local/bin/uvx',
+    'args': ['freshrelease-mcp'],
+    'env': {
+        'FRESHRELEASE_DOMAIN': 'freshworks.freshrelease.com',
+        'FRESHRELEASE_API_KEY': '${FR_KEY}'
+    }
+}
+json.dump(cfg, open(path, 'w'), indent=4)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+  info "Freshrelease MCP configured (per-user API key)"
+else
+  # No per-user key — remove Freshrelease MCP so host key doesn't leak
+  ssh_cmd "python3 -c \"
+import json, os
+path = '/sandbox/.claude/settings.json'
+if not os.path.exists(path):
+    exit(0)
+cfg = json.load(open(path))
+mcp = cfg.get('mcpServers', {})
+if 'freshrelease' in mcp:
+    del mcp['freshrelease']
+    json.dump(cfg, open(path, 'w'), indent=4)
+    os.chmod(path, 0o600)
+\"" 2>/dev/null
+fi
+
 # ── Claude MCP auth cache ────────────────────────────────────────
 if [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
   base64 "$CRED_DIR/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
@@ -102,29 +143,10 @@ elif [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
   info "Claude MCP auth cache injected (from host default)"
 fi
 
-# ── GitHub token ─────────────────────────────────────────────────
-GH_TOKEN=""
+# ── GitHub token (per-user only — no host fallback) ──────────────
 if [ -f "$CRED_DIR/gh-hosts.yml" ]; then
   base64 "$CRED_DIR/gh-hosts.yml" | ssh_cmd 'mkdir -p /sandbox/.config/gh && base64 -d > /sandbox/.config/gh/hosts.yml && chmod 600 /sandbox/.config/gh/hosts.yml'
   info "GitHub token injected (from user credentials)"
-else
-  # Fall back to host gh CLI token
-  if command -v gh > /dev/null 2>&1; then
-    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
-  fi
-  if [ -n "$GH_TOKEN" ]; then
-    GH_USER="${GITHUB_USER:-lakamsani}"
-    ssh_cmd "cat > /sandbox/.config/gh/hosts.yml" <<EOF
-github.com:
-  oauth_token: ${GH_TOKEN}
-  user: ${GH_USER}
-  git_protocol: https
-EOF
-    ssh_cmd 'chmod 600 /sandbox/.config/gh/hosts.yml'
-    info "GitHub token injected (from host gh CLI)"
-  else
-    warn "No GitHub token available"
-  fi
 fi
 
 # ── Google service account ───────────────────────────────────────
@@ -138,33 +160,31 @@ if [ -f "$GOOGLE_SA_PATH" ]; then
   info "Google service account injected"
 fi
 
-# ── gog CLI (Google OAuth) credentials ───────────────────────────
+# ── gog CLI (Google OAuth) credentials (per-user only — no host fallback) ──
 GOG_DIR="$CRED_DIR/gogcli"
-if [ ! -d "$GOG_DIR" ]; then
-  GOG_DIR="$HOME/.config/gogcli"
-fi
 if [ -d "$GOG_DIR" ]; then
   cd "$GOG_DIR" && tar czf - . | ssh_cmd 'mkdir -p /sandbox/.config/gogcli && tar xzf - -C /sandbox/.config/gogcli && chmod -R 700 /sandbox/.config/gogcli'
   cd "$REPO_DIR"
   info "gog OAuth credentials injected"
-else
-  warn "No gog config found — Google OAuth tools won't work"
 fi
 
 # ── User-specific .env values ────────────────────────────────────
-# GOG keyring password
-GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
+# GOG keyring password (per-user only)
 if [ -f "$CRED_DIR/../.env" ]; then
+  GOG_KEYRING_PW=""
   set -a; . "$CRED_DIR/../.env"; set +a
-  GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-$GOG_KEYRING_PW}"
+  GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-}"
+  if [ -n "$GOG_KEYRING_PW" ]; then
+    ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+    info "GOG_KEYRING_PASSWORD injected"
+  fi
 fi
-ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env"
-info "GOG_KEYRING_PASSWORD injected"
 
-# Slack webhook URL (optional fallback for heartbeat notifications)
-if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-  ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}' >> /sandbox/.env; chmod 600 /sandbox/.env"
-  info "Slack webhook URL injected"
+# Slack webhook URL (per-user only — no host fallback)
+if [ -f "$CRED_DIR/slack-webhook-url.txt" ]; then
+  USER_SLACK_WEBHOOK="$(cat "$CRED_DIR/slack-webhook-url.txt")"
+  ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${USER_SLACK_WEBHOOK}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${USER_SLACK_WEBHOOK}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  info "Slack webhook URL injected (from user credentials)"
 fi
 
 # Slack bot token (for DM-based heartbeat notifications — preferred over webhook)
@@ -186,32 +206,34 @@ if [ -f "$NOTIFY_SCRIPT" ]; then
   info "slack-notify helper installed"
 fi
 
-# ── xurl (X/Twitter) ────────────────────────────────────────────
-XURL_BIN="$REPO_DIR/persist/xurl-linux-arm64"
-if [ -f "$XURL_BIN" ]; then
-  base64 "$XURL_BIN" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/xurl && chmod +x /sandbox/.local/bin/xurl'
-  info "xurl binary injected"
+# ── xurl (X/Twitter) (per-user only — no host fallback) ──────────
+if [ -f "$CRED_DIR/xurl-binary" ]; then
+  base64 "$CRED_DIR/xurl-binary" | ssh_cmd 'mkdir -p /sandbox/.local/bin && base64 -d > /sandbox/.local/bin/xurl && chmod +x /sandbox/.local/bin/xurl'
+  info "xurl binary injected (from user credentials)"
 fi
 
-TWITTER_CREDS="${TWITTER_CREDS_PATH:-$HOME/twitter-claw.txt}"
 if [ -f "$CRED_DIR/twitter-creds.txt" ]; then
-  TWITTER_CREDS="$CRED_DIR/twitter-creds.txt"
-fi
-if [ -f "$TWITTER_CREDS" ]; then
-  set -a; . "$TWITTER_CREDS"; set +a
+  set -a; . "$CRED_DIR/twitter-creds.txt"; set +a
   ssh_cmd "export PATH='/sandbox/.local/bin:\$PATH' && \
     python3 -c \"import os; f=os.path.expanduser('~/.xurl'); os.path.exists(f) and os.remove(f)\" 2>/dev/null; \
     xurl auth apps add nemoclaw --client-id '${X_API_KEY}' --client-secret '${X_API_KEY_SECRET}' 2>/dev/null; \
     xurl auth oauth1 --consumer-key '${X_API_KEY}' --consumer-secret '${X_API_KEY_SECRET}' --access-token '${X_ACCESS_TOKEN}' --token-secret '${X_ACCESS_TOKEN_SECRET}' 2>/dev/null; \
     xurl auth app --bearer-token '${X_BEARER_TOKEN}' 2>/dev/null; \
     xurl auth default default 2>/dev/null" 2>&1 | grep -v '^\[' || true
-  info "xurl (X/Twitter) credentials configured"
+  info "xurl (X/Twitter) credentials configured (from user credentials)"
 fi
 
 # ── Git config ───────────────────────────────────────────────────
 if [ -n "$GITHUB_USER" ]; then
   ssh_cmd "git config --global user.name '${GITHUB_USER}' && git config --global user.email '${GITHUB_EMAIL}'" 2>/dev/null
   info "Git config set (user: $GITHUB_USER)"
+fi
+
+# ── uv / uvx (Python package runner) ─────────────────────────────
+if ! ssh_cmd 'test -x /root/.local/bin/uvx'; then
+  ssh_cmd 'curl -LsSf https://astral.sh/uv/install.sh | sh' 2>/dev/null && info "uv/uvx installed" || warn "uv/uvx install failed"
+else
+  info "uv/uvx already present"
 fi
 
 # ── Shell profile ────────────────────────────────────────────────

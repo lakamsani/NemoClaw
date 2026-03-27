@@ -106,7 +106,7 @@ rm -f "$TMPFILE"
 
 ssh_cmd 'export HOME=/sandbox; openclaw cron add \
   --name heartbeat \
-  --every 30m \
+  --every 1h \
   --agent main \
   --session isolated \
   --message "$(cat /tmp/heartbeat-msg.txt)" \
@@ -114,4 +114,4 @@ ssh_cmd 'export HOME=/sandbox; openclaw cron add \
   --no-deliver \
   2>&1 && rm -f /tmp/heartbeat-msg.txt'
 
-echo "[heartbeat-cron] Heartbeat cron job created (every 30m) for $SANDBOX"
+echo "[heartbeat-cron] Heartbeat cron job created (every 1h) for $SANDBOX"
