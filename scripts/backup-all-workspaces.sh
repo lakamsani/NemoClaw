@@ -49,6 +49,19 @@ if [ -f "$USERS_FILE" ] && python3 -c "import json; d=json.load(open('$USERS_FIL
       | tar xzf - -C "$WORKSPACE_DIR" 2>/dev/null || {
       echo "[backup-all] Backup failed for $NAME ($SANDBOX) — continuing..."
     }
+
+    # Backup GOG OAuth tokens from sandbox to per-user credentials dir
+    CRED_DIR=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('credentialsDir',''))" 2>/dev/null)
+    if [ -n "$CRED_DIR" ]; then
+      [[ "$CRED_DIR" != /* ]] && CRED_DIR="$REPO_DIR/$CRED_DIR"
+      GOG_BACKUP_DIR="$CRED_DIR/gogcli"
+      mkdir -p "$GOG_BACKUP_DIR/keyring"
+      ssh -F "/tmp/ssh-config-${SANDBOX}" -o StrictHostKeyChecking=no "openshell-${SANDBOX}" \
+        'cd /sandbox/.config/gogcli && tar czf - . 2>/dev/null || true' \
+        | tar xzf - -C "$GOG_BACKUP_DIR" 2>/dev/null && {
+        echo "[backup-all] GOG tokens backed up for $NAME"
+      } || true
+    fi
   done
 else
   # Legacy single-user mode

@@ -210,6 +210,18 @@ fi
 GOG_KEYRING_PW="${GOG_KEYRING_PASSWORD:-nemoclaw}"
 ssh_cmd "grep -q GOG_KEYRING_PASSWORD /sandbox/.env 2>/dev/null && sed -i 's|^GOG_KEYRING_PASSWORD=.*|GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}|' /sandbox/.env || echo 'GOG_KEYRING_PASSWORD=${GOG_KEYRING_PW}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
 
+# ── Proactive Google OAuth token refresh ─────────────────────────────
+# Exercise the GOG refresh token by making a lightweight Gmail labels call.
+# This keeps the refresh token alive (Google revokes unused tokens after
+# 6 months, or 7 days if the OAuth app is in "Testing" mode).
+# If the token has already been revoked (invalid_grant), log a warning.
+GOG_REFRESH_RESULT=$(ssh_cmd 'export HOME=/sandbox; export PATH=/sandbox/.local/bin:$PATH; export GOG_KEYRING_PASSWORD='"${GOG_KEYRING_PW}"'; gog gmail labels list -a "$(gog auth list -p 2>/dev/null | head -1)" --json 2>&1 | head -5' 2>/dev/null || true)
+if echo "$GOG_REFRESH_RESULT" | grep -q "invalid_grant"; then
+  echo "[refresh] WARNING: Google OAuth token revoked (invalid_grant) for $SANDBOX — manual re-auth needed ($(date))"
+elif echo "$GOG_REFRESH_RESULT" | grep -q "labels"; then
+  echo "[refresh] Google OAuth token exercised successfully for $SANDBOX ($(date))"
+fi
+
 # Re-inject Slack bot token (for heartbeat DMs)
 if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
   ssh_cmd "grep -q SLACK_BOT_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_BOT_TOKEN=.*|SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}|' /sandbox/.env || echo 'SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
