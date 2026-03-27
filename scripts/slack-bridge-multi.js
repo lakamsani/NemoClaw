@@ -21,7 +21,7 @@ const { execSync, spawn } = require("child_process");
 const fs = require("fs");
 const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
 const userRegistry = require("../bin/lib/user-registry");
-const { isSetupCommand, handleSetup, setupHelp } = require("../bin/lib/credential-setup");
+const { isSetupCommand, handleSetup, setupHelp, normalizeText } = require("../bin/lib/credential-setup");
 
 const OPENSHELL = resolveOpenshell();
 if (!OPENSHELL) {
@@ -77,6 +77,11 @@ function runAgentInSandbox(message, sessionId, sandboxName) {
         (l) =>
           !l.startsWith("Setting up NemoClaw") &&
           !l.startsWith("[plugins]") &&
+          !l.startsWith("[credentials]") &&
+          !l.startsWith("[config]") &&
+          !l.startsWith("[inject]") &&
+          !l.startsWith("[gateway]") &&
+          !l.startsWith("[auto-pair]") &&
           !l.startsWith("(node:") &&
           !l.includes("NemoClaw ready") &&
           !l.includes("NemoClaw registered") &&
@@ -203,8 +208,9 @@ async function main() {
 
     // ── !setup commands (self-service onboarding) ──────────────
     if (isSetupCommand(text)) {
-      // !setup help is available to everyone
-      if (text === "!setup help" || text === "!setup") {
+      // !setup help is available to everyone (normalize for mobile keyboard artifacts)
+      const normalized = normalizeText(text).toLowerCase();
+      if (normalized === "!setup help" || normalized === "!setup") {
         await reply(setupHelp());
         return;
       }
@@ -220,7 +226,7 @@ async function main() {
         return;
       }
 
-      const setupText = text.slice("!setup ".length);
+      const setupText = normalizeText(text).slice("!setup ".length);
       const displayName = user.slackDisplayName || event.user;
       console.log(`[setup] ${displayName}: !setup ${setupText.slice(0, 30)}...`);
 
@@ -247,15 +253,16 @@ async function main() {
     }
 
     // ── Normal message routing ─────────────────────────────────
+    // Only respond to 1:1 DMs — never respond to @mentions in channels or group chats
+    if (!isDM) {
+      console.log(`[ignored] non-DM message from ${event.user} in channel ${channel} — bot only responds in 1:1 DMs`);
+      return;
+    }
+
     if (!user) {
-      if (isDM) {
-        // User directly DMed the bot — tell them how to register
-        console.log(`[unregistered] user ${event.user} DMed bot`);
-        await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.");
-      } else {
-        // @mention in a channel — silently ignore, don't send unsolicited messages
-        console.log(`[ignored] user ${event.user} not registered, mentioned bot in channel`);
-      }
+      // User directly DMed the bot — tell them how to register
+      console.log(`[unregistered] user ${event.user} DMed bot`);
+      await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`\n\nOnce registered, DM me `!setup help` to configure your credentials.");
       return;
     }
 
@@ -270,8 +277,15 @@ async function main() {
         text: "Working on it...",
       });
 
-      const response = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}`, user.sandboxName);
+      let response = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}`, user.sandboxName);
       console.log(`[${channel}] ${user.sandboxName} → ${displayName}: ${response.slice(0, 100)}...`);
+
+      // Redact credential/auth errors in public channels — only show details in DMs
+      const isAuthError = /authentication_error|invalid_grant|Invalid authentication|401.*auth|expired.*token/i.test(response);
+      if (isAuthError && !isDM) {
+        console.error(`[${channel}] suppressing auth error in public channel for ${displayName}`);
+        response = "I'm having a temporary issue — please try again in a few minutes or DM me directly.";
+      }
 
       await app.client.chat.update({
         token: SLACK_BOT_TOKEN,
@@ -281,7 +295,13 @@ async function main() {
       });
     } catch (err) {
       console.error(`[${channel}] error for ${displayName}:`, err.message);
-      await say({ text: `Error: ${err.message}`, thread_ts: threadTs });
+      // Redact auth errors in public channels
+      const errMsg = err.message || "";
+      const isAuthErr = /authentication_error|invalid_grant|Invalid authentication|401.*auth/i.test(errMsg);
+      const safeMsg = (!isDM && isAuthErr)
+        ? "I'm having a temporary issue — please try again in a few minutes or DM me directly."
+        : `Error: ${errMsg}`;
+      await say({ text: safeMsg, thread_ts: threadTs });
     }
   }
 
