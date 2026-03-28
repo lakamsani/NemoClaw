@@ -3,3 +3,7 @@ review latest changes done in this repo by "codex" , criquue and suggest any imp
 ---
 
 save critique and summary deails to a markdown file called claude-critque.md . no need to fix any of them yet or push.
+
+---
+
+push the current changes to remote. push the "entire" checkpoint branch as well.
