@@ -121,3 +121,7 @@ what does manual commit mode mean?
 ---
 
 run entire commands to push what we have so far in logs. enable auto-commit mode from now on. be sure to do a sanity check for  sensitive information before committing any prompts via entire CLI
+
+---
+
+push it
