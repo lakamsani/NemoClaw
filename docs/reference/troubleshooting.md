@@ -47,19 +47,19 @@ If you see an unsupported platform error, verify that you are running on a suppo
 
 ### Node.js version is too old
 
-NemoClaw requires Node.js 20 or later.
+NemoClaw requires Node.js 22.16 or later.
 If the installer exits with a Node.js version error, check your current version:
 
 ```console
 $ node --version
 ```
 
-If the version is below 20, install a supported release.
+If the version is below 22.16, install a supported release.
 If you use nvm, run:
 
 ```console
-$ nvm install 20
-$ nvm use 20
+$ nvm install 22
+$ nvm use 22
 ```
 
 Then re-run the installer.
@@ -143,6 +143,56 @@ $ colima status
 
 ## Runtime
 
+### Reconnect after a host reboot
+
+After a host reboot, the container runtime, OpenShell gateway, and sandbox may not be running.
+Follow these steps to reconnect.
+
+1. Start the container runtime.
+
+   - **Linux:** start Docker if it is not already running (`sudo systemctl start docker`)
+   - **macOS:** open Docker Desktop or start Colima (`colima start`)
+
+1. Check sandbox state.
+
+   ```console
+   $ openshell sandbox list
+   ```
+
+   If the sandbox shows `Ready`, skip to step 4.
+
+1. Restart the gateway (if needed).
+
+   If the sandbox is not listed or the command fails, restart the OpenShell gateway:
+
+   ```console
+   $ openshell gateway start --name nemoclaw
+   ```
+
+   Wait a few seconds, then re-check with `openshell sandbox list`.
+
+1. Reconnect.
+
+   ```console
+   $ nemoclaw <name> connect
+   ```
+
+1. Start auxiliary services (if needed).
+
+   If you use the Telegram bridge or cloudflared tunnel, start them again:
+
+   ```console
+   $ nemoclaw start
+   ```
+
+:::{admonition} If the sandbox does not recover
+:class: warning
+
+If the sandbox remains missing after restarting the gateway, run `nemoclaw onboard` to recreate it.
+The wizard prompts for confirmation before destroying an existing sandbox. If you confirm, it **destroys and recreates** the sandbox — workspace files (SOUL.md, USER.md, IDENTITY.md, AGENTS.md, MEMORY.md, and daily memory notes) are lost.
+Back up your workspace first by following the instructions at [Back Up and Restore](../workspace/backup-restore.md).
+:::
+
 ### Sandbox shows as stopped
 
 The sandbox may have been stopped or deleted.
@@ -151,7 +201,7 @@ Run `nemoclaw onboard` to recreate the sandbox from the same blueprint and polic
 ### Status shows "not running" inside the sandbox
 
 This is expected behavior.
-When running `openclaw nemoclaw status` inside an active sandbox, host-side sandbox state and inference configuration are not inspectable.
+When checking status inside an active sandbox, host-side sandbox state and inference configuration are not inspectable.
 The status command detects the sandbox context and reports "active (inside sandbox)" instead.
 
 Run `openshell sandbox list` on the host to check the underlying sandbox state.
@@ -162,10 +212,11 @@ Verify that the inference provider endpoint is reachable from the host.
 Check the active provider and endpoint:
 
 ```console
-$ openclaw nemoclaw status
+$ nemoclaw <name> status
 ```
 
-If the endpoint is correct but requests still fail, check for network policy rules that may block the connection, and verify that your NVIDIA API key is valid.
+If the endpoint is correct but requests still fail, check for network policy rules that may block the connection.
+Then verify the credential and base URL for the provider you selected during onboarding.
 
 ### Agent cannot reach an external host
 
@@ -184,8 +235,7 @@ Refer to [Customize the Network Policy](../network-policy/customize-network-poli
 View the error output for the failed blueprint run:
 
 ```console
-$ openclaw nemoclaw logs --run-id <id>
+$ nemoclaw <name> logs
 ```
 
-If the run ID is unknown, omit `--run-id` to view logs from the most recent run.
 Use `--follow` to stream logs in real time while debugging.
