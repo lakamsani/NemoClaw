@@ -66,32 +66,78 @@ fail() {
   exit 1
 }
 
-is_running() {
+service_match_pattern() {
+  case "$1" in
+    slack-bridge) echo "node .*scripts/slack-bridge(-multi)?\\.js" ;;
+    telegram-bridge) echo "node .*scripts/telegram-bridge\\.js" ;;
+    cloudflared)
+      if [ -n "${DASHBOARD_PORT:-}" ]; then
+        echo "cloudflared tunnel --url http://localhost:${DASHBOARD_PORT}"
+      else
+        echo "cloudflared tunnel --url http://localhost:"
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_running_pid() {
   local pidfile="$PIDDIR/$1.pid"
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    cat "$pidfile"
     return 0
   fi
+  rm -f "$pidfile"
+  if command -v pgrep >/dev/null 2>&1; then
+    local pattern
+    pattern="$(service_match_pattern "$1" || true)"
+    if [ -n "$pattern" ]; then
+      local pid
+      pid="$(pgrep -fo "$pattern" || true)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid" >"$pidfile"
+        echo "$pid"
+        return 0
+      fi
+    fi
+  fi
   return 1
+}
+
+is_running() {
+  resolve_running_pid "$1" >/dev/null
 }
 
 start_service() {
   local name="$1"
   shift
-  if is_running "$name"; then
-    info "$name already running (PID $(cat "$PIDDIR/$name.pid"))"
+  local existing_pid
+  if existing_pid="$(resolve_running_pid "$name")"; then
+    info "$name already running (PID $existing_pid)"
     return 0
   fi
-  nohup "$@" >"$PIDDIR/$name.log" 2>&1 &
-  echo $! >"$PIDDIR/$name.pid"
-  info "$name started (PID $!)"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$@" </dev/null >"$PIDDIR/$name.log" 2>&1
+  else
+    nohup "$@" </dev/null >"$PIDDIR/$name.log" 2>&1 &
+  fi
+  sleep 1
+  local pid
+  if ! pid="$(resolve_running_pid "$name")"; then
+    warn "$name failed to stay up; check $PIDDIR/$name.log"
+    tail -20 "$PIDDIR/$name.log" 2>/dev/null || true
+    rm -f "$PIDDIR/$name.pid"
+    return 1
+  fi
+  echo "$pid" >"$PIDDIR/$name.pid"
+  info "$name started (PID $pid)"
 }
 
 stop_service() {
   local name="$1"
   local pidfile="$PIDDIR/$name.pid"
-  if [ -f "$pidfile" ]; then
-    local pid
-    pid="$(cat "$pidfile")"
+  local pid
+  if pid="$(resolve_running_pid "$name")"; then
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
       info "$name stopped (PID $pid)"
@@ -107,9 +153,10 @@ stop_service() {
 show_status() {
   mkdir -p "$PIDDIR"
   echo ""
-  for svc in slack-bridge; do
-    if is_running "$svc"; then
-      echo -e "  ${GREEN}●${NC} $svc  (PID $(cat "$PIDDIR/$svc.pid"))"
+  for svc in slack-bridge telegram-bridge cloudflared; do
+    local pid
+    if pid="$(resolve_running_pid "$svc")"; then
+      echo -e "  ${GREEN}●${NC} $svc  (PID $pid)"
     else
       echo -e "  ${RED}●${NC} $svc  (stopped)"
     fi
@@ -120,6 +167,8 @@ show_status() {
 do_stop() {
   mkdir -p "$PIDDIR"
   stop_service slack-bridge
+  stop_service telegram-bridge
+  stop_service cloudflared
   info "All services stopped."
 }
 

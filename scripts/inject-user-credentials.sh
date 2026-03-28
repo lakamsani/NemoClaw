@@ -20,6 +20,10 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
+SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+SHARED_CLAUDE_SETTINGS="${NEMOCLAW_SHARED_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+SHARED_CLAUDE_MCP_CACHE="${NEMOCLAW_SHARED_CLAUDE_MCP_CACHE:-$HOME/.claude/mcp-needs-auth-cache.json}"
+
 SANDBOX="${1:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir> [--github-user <user>]}"
 CRED_DIR="${2:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir>}"
 shift 2
@@ -76,10 +80,10 @@ fi
 # ── Claude Code credentials ──────────────────────────────────────
 if [ -f "$CRED_DIR/claude-credentials.json" ]; then
   base64 "$CRED_DIR/claude-credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  info "Claude credentials injected"
-elif [ -f "$HOME/.claude/.credentials.json" ]; then
-  base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  info "Claude credentials injected (from host default)"
+  info "Claude credentials injected (per-user)"
+elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
+  base64 "$SHARED_CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+  info "Claude credentials injected (shared org fallback)"
 else
   warn "No Claude credentials found"
 fi
@@ -87,10 +91,10 @@ fi
 # Claude settings
 if [ -f "$CRED_DIR/claude-settings.json" ]; then
   base64 "$CRED_DIR/claude-settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
-  info "Claude settings injected"
-elif [ -f "$HOME/.claude/settings.json" ]; then
-  base64 "$HOME/.claude/settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
-  info "Claude settings injected (from host default)"
+  info "Claude settings injected (per-user)"
+elif [ -f "$SHARED_CLAUDE_SETTINGS" ]; then
+  base64 "$SHARED_CLAUDE_SETTINGS" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
+  info "Claude settings injected (shared org fallback)"
 fi
 
 # ── Freshrelease MCP server (per-user API key) ───────────────────
@@ -137,10 +141,10 @@ fi
 # ── Claude MCP auth cache ────────────────────────────────────────
 if [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
   base64 "$CRED_DIR/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
-  info "Claude MCP auth cache injected"
-elif [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
-  base64 "$HOME/.claude/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
-  info "Claude MCP auth cache injected (from host default)"
+  info "Claude MCP auth cache injected (per-user)"
+elif [ -f "$SHARED_CLAUDE_MCP_CACHE" ]; then
+  base64 "$SHARED_CLAUDE_MCP_CACHE" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
+  info "Claude MCP auth cache injected (shared org fallback)"
 fi
 
 # ── GitHub token (per-user only — no host fallback) ──────────────
