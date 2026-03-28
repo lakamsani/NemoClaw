@@ -1,0 +1,43 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "76460c73026a",
+  "session_id": "6fbf035f-d83c-4e45-b3ad-75fa9fea6db2",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-28T19:16:57.441554001Z",
+  "branch": "multi-user-claude",
+  "checkpoints_count": 24,
+  "files_touched": [
+    ".claude/commands/add-claw.md",
+    ".claude/commands/delete-claw.md",
+    "bin/lib/user-registry.js",
+    "bin/nemoclaw.js",
+    "scripts/nemoclaw-resilience.sh",
+    "scripts/refresh-all-credentials.sh",
+    "scripts/refresh-credentials.sh",
+    "scripts/setup-cron.sh",
+    "scripts/slack-bridge-multi.js",
+    "test/registry.test.js"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6",
+  "turn_id": "939707407abd",
+  "token_usage": {
+    "input_tokens": 845,
+    "cache_creation_tokens": 78112,
+    "cache_read_tokens": 5304968,
+    "output_tokens": 18254,
+    "api_call_count": 97
+  },
+  "session_metrics": {
+    "turn_count": 23
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-28T19:16:57.282663275Z",
+    "agent_lines": 17,
+    "human_added": 2262,
+    "human_modified": 276,
+    "human_removed": 0,
+    "total_committed": 2547,
+    "agent_percentage": 0.6674519042010209
+  }
+}

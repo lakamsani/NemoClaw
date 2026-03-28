@@ -1,0 +1,90 @@
+sync and merge with upstream
+
+---
+
+summarize all changes and present a plan to push it all to remote. Also can we run some sanity tests to ensure we are not breaking the existing claws, how they use claude, interact with slackbot, gog client etc.
+
+---
+
+yes
+
+---
+
+run entire status
+
+---
+
+change the color of model in status line to yellow so it is more visible, same with time usd
+
+---
+
+how to start a new tmux session when already inside one.
+
+---
+
+comment out the current Gemini API key saying it is personal. Add a new var with value REDACTED  and  a comment that it is from Freshworks GCP project https://aistudio.google.com/app/api-keys?project=cobalt-entropy-490114-b7
+
+---
+
+do we have gemni and codex clis on this machine are they setup with correct API keys? run a sanity test.
+
+---
+
+test codex again
+
+---
+
+just added it.
+
+---
+
+here is the new API key. Update ~/.env as well with it and use it. 
+REDACTED
+
+---
+
+where do we keep the list of users
+
+---
+
+another coding agent codex is making some improvements for security, reliaibility. It is also adding a admin role feature to enable some registered slack users to create claws for other users. It also ported over the "/add-claw" and "/delete-claw" claude commands to portable agent skills (for background on this see https://agentskills.io/home) . Review all those changes and provide a critique, if you agree with them and/or if you suggest further changes.
+
+---
+
+no. 1 and 2 are intentional. we want everyone to configure their own webhooks and GOG keyring password. 3 seems minor.
+
+---
+
+not yet. we are still testing.
+
+---
+
+how to mark some registered users as admins
+
+---
+
+vamsee, kiran and arpit
+
+---
+
+how to make tmux show hostname , user and git repo in iterm title?
+
+---
+
+make all those changes
+
+---
+
+! tmux source ~/.tmux.conf && source ~/.zshrc
+
+---
+
+no it still just shows "tmux(ssh)"
+
+---
+
+! tmux source ~/.tmux.conf && source ~/.zshrc
+
+---
+
+still shows "tmux(ssh)"
