@@ -47,6 +47,9 @@ const REPO_DIR = require("path").resolve(__dirname, "..");
 const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication|401.*auth|expired.*token|OAuth token has expired/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
 const pendingDeleteRequests = new Map();
+function sh(value) {
+  return String(value).replace(/'/g, "'\\''");
+}
 const DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const MAX_DISPLAY_NAME_LENGTH = 80;
 const MAX_GITHUB_HANDLE_LENGTH = 39;
