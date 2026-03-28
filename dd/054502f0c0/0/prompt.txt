@@ -1,0 +1,33 @@
+review latest changes done in this repo by "codex" , criquue and suggest any improvements. After that wait for my approval before pushing to remote.
+
+---
+
+save critique and summary deails to a markdown file called claude-critque.md . no need to fix any of them yet or push.
+
+---
+
+push the current changes to remote. push the "entire" checkpoint branch as well.
+
+---
+
+what is "entire/81a52ef-79de9a" for? delete it from remote for sure.
+
+---
+
+print all the additional commands available to admin users
+
+---
+
+what is considered an admin-audit entry?
+
+---
+
+some of the suggestions you had in claude-critique.md  have been fixed by codex. please review again.
+
+---
+
+push these changes to remote
+
+---
+
+getting error "Error: sh is not defined" when i just asked the slack bot to add a new tak to google calendar
