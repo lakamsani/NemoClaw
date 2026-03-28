@@ -15,11 +15,14 @@ process.env.HOME = tmpDir;
 
 const require = createRequire(import.meta.url);
 const registry = require("../bin/lib/registry");
+const userRegistry = require("../bin/lib/user-registry");
 
 const regFile = path.join(tmpDir, ".nemoclaw", "sandboxes.json");
+const userRegFile = path.join(tmpDir, ".nemoclaw", "users.json");
 
 beforeEach(() => {
   if (fs.existsSync(regFile)) fs.unlinkSync(regFile);
+  if (fs.existsSync(userRegFile)) fs.unlinkSync(userRegFile);
 });
 
 describe("registry", () => {
@@ -104,5 +107,41 @@ describe("registry", () => {
     // Should not throw, returns empty
     const { sandboxes } = registry.listSandboxes();
     expect(sandboxes.length).toBe(0);
+  });
+});
+
+describe("user-registry", () => {
+  it("registers users with a default user role", () => {
+    userRegistry.registerUser({
+      slackUserId: "U123ABC",
+      slackDisplayName: "Alice",
+      sandboxName: "alice-claw",
+    });
+    const user = userRegistry.getUser("U123ABC");
+    expect(user.roles).toEqual(["user"]);
+    expect(user.timezone).toBe("UTC");
+  });
+
+  it("preserves explicit roles and normalizes user membership", () => {
+    userRegistry.registerUser({
+      slackUserId: "U999XYZ",
+      slackDisplayName: "Admin",
+      sandboxName: "admin-claw",
+      roles: ["admin"],
+    });
+    const user = userRegistry.getUser("U999XYZ");
+    expect(user.roles).toEqual(["user", "admin"]);
+  });
+
+  it("updates roles and enabled status", () => {
+    userRegistry.registerUser({
+      slackUserId: "U222DEF",
+      slackDisplayName: "Bob",
+      sandboxName: "bob-claw",
+    });
+    expect(userRegistry.updateUser("U222DEF", { enabled: false, roles: ["admin"] })).toBe(true);
+    const user = userRegistry.getUser("U222DEF");
+    expect(user.enabled).toBe(false);
+    expect(user.roles).toEqual(["user", "admin"]);
   });
 });

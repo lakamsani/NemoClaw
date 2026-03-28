@@ -13,8 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 CRON_ENTRIES=(
-  "# NemoClaw credential refresh — all users (every 30 minutes)"
-  "*/30 * * * * $SCRIPT_DIR/refresh-all-credentials.sh >> /tmp/nemoclaw-cred-refresh.log 2>&1"
+  "# NemoClaw credential refresh — all users (every 15 minutes)"
+  "*/15 * * * * $SCRIPT_DIR/refresh-all-credentials.sh >> /tmp/nemoclaw-cred-refresh.log 2>&1"
   "# NemoClaw workspace backup — all users (every 2 hours)"
   "0 */2 * * * $SCRIPT_DIR/backup-all-workspaces.sh >> /tmp/nemoclaw-workspace-backup.log 2>&1"
 )

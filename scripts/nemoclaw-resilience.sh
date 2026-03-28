@@ -361,9 +361,20 @@ ssh_cmd 'find /sandbox/.openclaw/cron /sandbox/.openclaw/agents -user root -dele
 nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
   'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &
 disown
-sleep 5
-ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null || true
-info "Gateway started"
+
+GATEWAY_HEALTHY=false
+for i in $(seq 1 10); do
+  if ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null; then
+    GATEWAY_HEALTHY=true
+    break
+  fi
+  sleep 2
+done
+
+if [ "$GATEWAY_HEALTHY" != "true" ]; then
+  fail "Gateway failed health check after restart for sandbox '$SANDBOX'"
+fi
+info "Gateway started and healthy"
 
 # ── Step 6: Restore workspace personality files ──────────────────
 # Try per-user workspace first, then fall back to default

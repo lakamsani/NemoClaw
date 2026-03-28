@@ -28,15 +28,6 @@ if [ -f "$USERS_FILE" ] && python3 -c "import json; d=json.load(open('$USERS_FIL
     CRED_DIR=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('credentialsDir',''))")
     NAME=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('slackDisplayName','$uid'))")
 
-    # Sync host Claude OAuth token to per-user cred dir (keeps persist copy fresh)
-    if [ -n "$CRED_DIR" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-      FULL_CRED_DIR="$CRED_DIR"
-      [[ "$FULL_CRED_DIR" != /* ]] && FULL_CRED_DIR="$REPO_DIR/$FULL_CRED_DIR"
-      if [ -f "$FULL_CRED_DIR/claude-credentials.json" ]; then
-        cp "$HOME/.claude/.credentials.json" "$FULL_CRED_DIR/claude-credentials.json"
-      fi
-    fi
-
     echo "[refresh-all] Refreshing credentials for $NAME → $SANDBOX ($(date))"
     CRED_FLAG=""
     [ -n "$CRED_DIR" ] && CRED_FLAG="--cred-dir $CRED_DIR"

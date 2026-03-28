@@ -8,10 +8,44 @@ const path = require("path");
 
 const REGISTRY_FILE = path.join(process.env.HOME || "/tmp", ".nemoclaw", "users.json");
 
+function normalizeRoles(roles) {
+  const raw = Array.isArray(roles)
+    ? roles
+    : typeof roles === "string" && roles.trim()
+      ? roles.split(",")
+      : [];
+  const normalized = raw
+    .map((role) => String(role).trim().toLowerCase())
+    .filter(Boolean);
+  if (!normalized.includes("user")) normalized.unshift("user");
+  return [...new Set(normalized)];
+}
+
+function hydrateUser(slackUserId, entry = {}) {
+  return {
+    slackUserId: entry.slackUserId || slackUserId,
+    slackDisplayName: entry.slackDisplayName || "",
+    sandboxName: entry.sandboxName,
+    githubUser: entry.githubUser || "",
+    createdAt: entry.createdAt || new Date().toISOString(),
+    personalityDir: entry.personalityDir || `persist/users/${slackUserId}/workspace`,
+    credentialsDir: entry.credentialsDir || `persist/users/${slackUserId}/credentials`,
+    enabled: entry.enabled !== undefined ? entry.enabled : true,
+    timezone: entry.timezone || "UTC",
+    roles: normalizeRoles(entry.roles),
+  };
+}
+
 function load() {
   try {
     if (fs.existsSync(REGISTRY_FILE)) {
-      return JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
+      const data = JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
+      if (data && data.users && typeof data.users === "object") {
+        for (const [slackUserId, entry] of Object.entries(data.users)) {
+          data.users[slackUserId] = hydrateUser(slackUserId, entry);
+        }
+      }
+      return data;
     }
   } catch {}
   return { users: {}, defaultUser: null, deletedUsers: [] };
@@ -44,17 +78,7 @@ function getDefault() {
 
 function registerUser(entry) {
   const data = load();
-  data.users[entry.slackUserId] = {
-    slackUserId: entry.slackUserId,
-    slackDisplayName: entry.slackDisplayName || "",
-    sandboxName: entry.sandboxName,
-    githubUser: entry.githubUser || "",
-    createdAt: entry.createdAt || new Date().toISOString(),
-    personalityDir: entry.personalityDir || `persist/users/${entry.slackUserId}/workspace`,
-    credentialsDir: entry.credentialsDir || `persist/users/${entry.slackUserId}/credentials`,
-    enabled: entry.enabled !== undefined ? entry.enabled : true,
-    timezone: entry.timezone || "UTC",
-  };
+  data.users[entry.slackUserId] = hydrateUser(entry.slackUserId, entry);
   if (!data.defaultUser) {
     data.defaultUser = entry.slackUserId;
   }
@@ -64,7 +88,10 @@ function registerUser(entry) {
 function updateUser(slackUserId, updates) {
   const data = load();
   if (!data.users[slackUserId]) return false;
-  Object.assign(data.users[slackUserId], updates);
+  data.users[slackUserId] = hydrateUser(slackUserId, {
+    ...data.users[slackUserId],
+    ...updates,
+  });
   save(data);
   return true;
 }
@@ -119,4 +146,5 @@ module.exports = {
   isDeletedUser,
   listUsers,
   setDefault,
+  normalizeRoles,
 };

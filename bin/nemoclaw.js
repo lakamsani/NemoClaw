@@ -41,6 +41,7 @@ const GLOBAL_COMMANDS = new Set([
   "onboard", "list", "deploy", "setup", "setup-spark",
   "start", "stop", "status", "debug", "uninstall",
   "user-add", "user-remove", "user-purge", "user-list", "user-status",
+  "user-enable", "user-disable", "user-grant-admin", "user-revoke-admin",
   "help", "--help", "-h", "--version", "-v",
 ]);
 
@@ -575,6 +576,7 @@ async function userAdd(args = []) {
 
   // Parse --non-interactive mode with named args
   const nonInteractive = args.includes("--non-interactive");
+  const argAdmin = args.includes("--admin");
   let argSlackId, argDisplayName, argClawName, argGithubUser;
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -586,7 +588,7 @@ async function userAdd(args = []) {
   }
 
   if (nonInteractive && (!argSlackId || !argDisplayName || !argClawName)) {
-    console.error("  Usage: nemoclaw user-add --non-interactive --slack-id <ID> --display-name <NAME> --claw-name <NAME> [--github-user <USER>]");
+    console.error("  Usage: nemoclaw user-add --non-interactive --slack-id <ID> --display-name <NAME> --claw-name <NAME> [--github-user <USER>] [--admin]");
     process.exit(1);
   }
 
@@ -735,7 +737,10 @@ async function userAdd(args = []) {
     personalityDir: workspaceDir,
     credentialsDir: credDir,
     enabled: true,
+    roles: argAdmin ? ["user", "admin"] : ["user"],
   });
+
+  const roles = userReg.getUser(slackUserId)?.roles || ["user"];
 
   console.log("");
   console.log(`  User registered:`);
@@ -743,6 +748,7 @@ async function userAdd(args = []) {
   console.log(`    Name:        ${slackDisplayName}`);
   console.log(`    Sandbox:     ${sandboxName}`);
   console.log(`    GitHub:      ${githubUser || "(none)"}`);
+  console.log(`    Roles:       ${roles.join(", ")}`);
   console.log(`    Credentials: ${credDir}`);
   console.log(`    Workspace:   ${workspaceDir}`);
   console.log("");
@@ -885,7 +891,7 @@ function userList() {
     const def = u.slackUserId === defaultUser ? " *" : "";
     const status = u.enabled ? "enabled" : "disabled";
     console.log(`    ${u.slackDisplayName || u.slackUserId}${def}`);
-    console.log(`      slack: ${u.slackUserId}  sandbox: ${u.sandboxName}  github: ${u.githubUser || "-"}  ${status}`);
+    console.log(`      slack: ${u.slackUserId}  sandbox: ${u.sandboxName}  github: ${u.githubUser || "-"}  ${status}  roles: ${(u.roles || ["user"]).join(",")}`);
   }
   console.log("");
   console.log("  * = default user");
@@ -909,6 +915,7 @@ function userStatus(slackUserId) {
   console.log(`    Sandbox:     ${user.sandboxName}`);
   console.log(`    GitHub:      ${user.githubUser || "-"}`);
   console.log(`    Enabled:     ${user.enabled}`);
+  console.log(`    Roles:       ${(user.roles || ["user"]).join(", ")}`);
   console.log(`    Credentials: ${user.credentialsDir}`);
   console.log(`    Workspace:   ${user.personalityDir}`);
   console.log(`    Created:     ${user.createdAt}`);
@@ -925,6 +932,55 @@ function userStatus(slackUserId) {
   } catch {
     console.log("    Sandbox:     (cannot check — openshell not available)");
   }
+  console.log("");
+}
+
+function userSetEnabled(slackUserId, enabled) {
+  if (!slackUserId) {
+    console.error(`  Usage: nemoclaw ${enabled ? "user-enable" : "user-disable"} <slack-user-id>`);
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  if (!userReg.updateUser(slackUserId, { enabled })) {
+    console.error(`  Failed to update ${slackUserId}.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User ${user.slackDisplayName || slackUserId} is now ${enabled ? "enabled" : "disabled"}.`);
+  console.log("");
+}
+
+function userSetAdmin(slackUserId, grantAdmin) {
+  if (!slackUserId) {
+    console.error(`  Usage: nemoclaw ${grantAdmin ? "user-grant-admin" : "user-revoke-admin"} <slack-user-id>`);
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  const roles = new Set(user.roles || ["user"]);
+  roles.add("user");
+  if (grantAdmin) roles.add("admin");
+  else roles.delete("admin");
+
+  if (!userReg.updateUser(slackUserId, { roles: [...roles] })) {
+    console.error(`  Failed to update ${slackUserId}.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User ${user.slackDisplayName || slackUserId} roles: ${[...roles].join(", ")}`);
   console.log("");
 }
 
@@ -1106,6 +1162,10 @@ function help() {
     nemoclaw user-purge --slack-id <id>   Same, by Slack user ID
     nemoclaw user-list               List all registered users
     nemoclaw user-status <slack-id>  Show user details and sandbox health
+    nemoclaw user-enable <slack-id>  Enable a registered user in the Slack bridge
+    nemoclaw user-disable <slack-id> Disable a registered user in the Slack bridge
+    nemoclaw user-grant-admin <id>   Grant admin role to a registered user
+    nemoclaw user-revoke-admin <id>  Revoke admin role from a registered user
 
   ${G}Deploy:${R}
     nemoclaw deploy <instance>       Deploy to a Brev VM and start services
@@ -1163,6 +1223,10 @@ const [cmd, ...args] = process.argv.slice(2);
       case "user-purge":  userPurge(args); break;
       case "user-list":   userList(); break;
       case "user-status": userStatus(args[0]); break;
+      case "user-enable": userSetEnabled(args[0], true); break;
+      case "user-disable": userSetEnabled(args[0], false); break;
+      case "user-grant-admin": userSetAdmin(args[0], true); break;
+      case "user-revoke-admin": userSetAdmin(args[0], false); break;
       case "--version":
       case "-v": {
         const pkg = require(path.join(__dirname, "..", "package.json"));
