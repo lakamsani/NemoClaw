@@ -23,3 +23,7 @@ what is considered an admin-audit entry?
 ---
 
 some of the suggestions you had in claude-critique.md  have been fixed by codex. please review again.
+
+---
+
+push these changes to remote
