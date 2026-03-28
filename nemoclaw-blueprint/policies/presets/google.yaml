@@ -3,7 +3,7 @@
 
 preset:
   name: google
-  description: "Google Workspace APIs (Drive, Calendar, Gmail, Sheets, Docs, Slides)"
+  description: "Google Workspace APIs (Drive, Calendar, Gmail, Sheets, Docs, Slides, Tasks)"
 
 network_policies:
   google:
@@ -37,6 +37,9 @@ network_policies:
         port: 443
         access: full
       - host: slides.googleapis.com
+        port: 443
+        access: full
+      - host: tasks.googleapis.com
         port: 443
         access: full
     binaries:
