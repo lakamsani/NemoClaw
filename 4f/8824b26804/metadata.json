@@ -1,0 +1,28 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "4f8824b26804",
+  "strategy": "manual-commit",
+  "branch": "multi-user-claude",
+  "checkpoints_count": 6,
+  "files_touched": [
+    "scripts/nemoclaw-resilience.sh",
+    "scripts/refresh-credentials.sh",
+    "scripts/slack-bridge-multi.js",
+    "test/slack-bridge-multi.test.js"
+  ],
+  "sessions": [
+    {
+      "metadata": "/4f/8824b26804/0/metadata.json",
+      "transcript": "/4f/8824b26804/0/full.jsonl",
+      "content_hash": "/4f/8824b26804/0/content_hash.txt",
+      "prompt": "/4f/8824b26804/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 49,
+    "cache_creation_tokens": 60136,
+    "cache_read_tokens": 1714206,
+    "output_tokens": 9739,
+    "api_call_count": 33
+  }
+}
