@@ -18,7 +18,7 @@
  *   SLACK_ADMIN_USERS — comma-separated Slack user IDs treated as admins on DGX
  */
 
-const { execSync, spawn } = require("child_process");
+const { execFileSync, execSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
@@ -47,10 +47,15 @@ const REPO_DIR = require("path").resolve(__dirname, "..");
 const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication|401.*auth|expired.*token|OAuth token has expired/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
 const pendingDeleteRequests = new Map();
-
-function sh(value) {
-  return String(value).replace(/'/g, "'\\''");
-}
+const DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
+const MAX_DISPLAY_NAME_LENGTH = 80;
+const MAX_GITHUB_HANDLE_LENGTH = 39;
+const SHARED_CLAUDE_CREDENTIALS = process.env.NEMOCLAW_SHARED_CLAUDE_CREDENTIALS
+  || path.join(process.env.HOME || "/tmp", ".claude", ".credentials.json");
+const SHARED_CLAUDE_SETTINGS = process.env.NEMOCLAW_SHARED_CLAUDE_SETTINGS
+  || path.join(process.env.HOME || "/tmp", ".claude", "settings.json");
+const SHARED_CLAUDE_MCP_CACHE = process.env.NEMOCLAW_SHARED_CLAUDE_MCP_CACHE
+  || path.join(process.env.HOME || "/tmp", ".claude", "mcp-needs-auth-cache.json");
 
 function withAdminState(user) {
   if (!user) return null;
@@ -89,6 +94,11 @@ function isShowUserCommand(text) {
   return normalized.startsWith("!show-user");
 }
 
+function isAdminHelpCommand(text) {
+  const normalized = normalizeText(text).toLowerCase();
+  return normalized === "!admin-help" || normalized === "!help-admin";
+}
+
 function parseCommandArgs(text) {
   const args = [];
   const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
@@ -113,8 +123,8 @@ function auditAdminAction(actor, action, details = {}, outcome = "started", erro
   fs.appendFileSync(ADMIN_AUDIT_LOG, `${JSON.stringify(record)}\n`, "utf-8");
 }
 
-function runAdminCommand(command, timeout = 300000) {
-  return execSync(command, {
+function runAdminCommand(file, args = [], timeout = 300000) {
+  return execFileSync(file, args, {
     cwd: REPO_DIR,
     encoding: "utf-8",
     timeout,
@@ -124,10 +134,11 @@ function runAdminCommand(command, timeout = 300000) {
 
 function getProvisioningSummary(slackId, clawName) {
   try {
-    const statusOutput = runAdminCommand(
-      `node bin/nemoclaw.js user-status '${sh(slackId)}'`,
-      120000
-    ).trim();
+    const statusOutput = runAdminCommand(process.execPath, [
+      "bin/nemoclaw.js",
+      "user-status",
+      slackId,
+    ], 120000).trim();
     return statusOutput.slice(-2500) || "(no status output)";
   } catch (err) {
     const output = `${err.stdout || ""}${err.stderr || ""}`.trim() || err.message;
@@ -229,6 +240,22 @@ function formatRecentAdminAudit(limit = 10) {
   return lines.join("\n");
 }
 
+function formatAdminHelp() {
+  return [
+    "*Admin Commands*",
+    "`!admin-help`",
+    "`!admins`",
+    "`!admin-audit`",
+    "`!show-claws [ready|not-ready|registered|unregistered|admins|non-admins|gpu] [sort=name|user|status|uptime] [match=...] [policy=...] [cred=...]`",
+    "`!show-user <slack-id|claw-name|name-fragment>`",
+    "`!add-claw <slack_id> <display_name> <claw_name> <github_handle>`",
+    "`!delete-claw <claw_name>`",
+    "`!confirm-delete-claw <claw_name>`",
+    "",
+    `Delete confirmations expire after ${Math.floor(DELETE_CONFIRM_TTL_MS / 60000)} minutes and are lost if the bridge restarts.`,
+  ].join("\n");
+}
+
 function parseSandboxList(raw) {
   const sandboxes = new Map();
   for (const line of String(raw || "").split("\n")) {
@@ -278,6 +305,35 @@ function formatDurationFrom(dateLike) {
 
 function getInventoryStatus(item) {
   return item.liveSandbox?.phase || (item.registrySandbox ? "Registry only" : "Unknown");
+}
+
+function getClaudeCredentialSource(user) {
+  if (!user?.credentialsDir) return { mode: "missing", path: "" };
+  const credDir = path.isAbsolute(user.credentialsDir)
+    ? user.credentialsDir
+    : path.join(REPO_DIR, user.credentialsDir);
+  const perUserPath = path.join(credDir, "claude-credentials.json");
+  if (fs.existsSync(perUserPath)) {
+    return { mode: "per-user", path: perUserPath };
+  }
+  if (fs.existsSync(SHARED_CLAUDE_CREDENTIALS)) {
+    return { mode: "shared-org", path: SHARED_CLAUDE_CREDENTIALS };
+  }
+  return { mode: "missing", path: "" };
+}
+
+function describeClaudeCredentialSource(user) {
+  const source = getClaudeCredentialSource(user);
+  if (source.mode === "per-user") return "per-user";
+  if (source.mode === "shared-org") return `shared org fallback (\`${source.path}\`)`;
+  return "not configured";
+}
+
+function describeClaudeSupportFiles() {
+  const details = [];
+  if (fs.existsSync(SHARED_CLAUDE_SETTINGS)) details.push(`settings: \`${SHARED_CLAUDE_SETTINGS}\``);
+  if (fs.existsSync(SHARED_CLAUDE_MCP_CACHE)) details.push(`mcp cache: \`${SHARED_CLAUDE_MCP_CACHE}\``);
+  return details.length ? details.join(", ") : "none";
 }
 
 function listConfiguredCredentials(user) {
@@ -598,6 +654,8 @@ function buildShowUserText(user) {
     `GitHub: ${user.githubUser ? `\`${user.githubUser}\`` : "_none_"}`,
     `Status: ${liveSandbox?.phase || "Not Found"}`,
     `Up For: ${formatDurationFrom(liveSandbox?.createdAt || registrySandbox?.createdAt || user.createdAt)}`,
+    `Claude Auth: ${describeClaudeCredentialSource(user)}`,
+    `Shared Claude Support: ${describeClaudeSupportFiles()}`,
     `Credentials: ${credentials.length ? credentials.join(", ") : "none"}`,
     `Policies: ${policies.length ? policies.join(", ") : "none"}`,
   ].join("\n");
@@ -628,17 +686,43 @@ async function handleAddClaw(user, text) {
   if (!displayName.trim() || !githubHandle.trim()) {
     return { ok: false, message: formatAddClawUsage() };
   }
+  if (displayName.trim().length > MAX_DISPLAY_NAME_LENGTH) {
+    return { ok: false, message: `Display name is too long. Limit is ${MAX_DISPLAY_NAME_LENGTH} characters.` };
+  }
+  if (!/^[A-Za-z0-9-]+$/.test(githubHandle) || githubHandle.length > MAX_GITHUB_HANDLE_LENGTH) {
+    return {
+      ok: false,
+      message: `Invalid GitHub handle: \`${githubHandle}\`. Use letters, numbers, hyphens, and at most ${MAX_GITHUB_HANDLE_LENGTH} characters.`,
+    };
+  }
 
   auditAdminAction(user, "add-claw", { slackId, displayName, clawName, githubHandle }, "started");
 
   try {
-    const userAddOutput = runAdminCommand(
-      `node bin/nemoclaw.js user-add --non-interactive --slack-id '${sh(slackId)}' --display-name '${sh(displayName)}' --claw-name '${sh(clawName)}' --github-user '${sh(githubHandle)}'`
-    );
-    const resilienceOutput = runAdminCommand(
-      `bash scripts/nemoclaw-resilience.sh --sandbox '${sh(clawName)}' --cred-dir 'persist/users/${sh(slackId)}/credentials' --github-user '${sh(githubHandle)}' --slack-user-id '${sh(slackId)}'`,
-      600000
-    );
+    const userAddOutput = runAdminCommand(process.execPath, [
+      "bin/nemoclaw.js",
+      "user-add",
+      "--non-interactive",
+      "--slack-id",
+      slackId,
+      "--display-name",
+      displayName,
+      "--claw-name",
+      clawName,
+      "--github-user",
+      githubHandle,
+    ]);
+    const resilienceOutput = runAdminCommand("bash", [
+      "scripts/nemoclaw-resilience.sh",
+      "--sandbox",
+      clawName,
+      "--cred-dir",
+      `persist/users/${slackId}/credentials`,
+      "--github-user",
+      githubHandle,
+      "--slack-user-id",
+      slackId,
+    ], 600000);
     const statusSummary = getProvisioningSummary(slackId, clawName);
     auditAdminAction(user, "add-claw", { slackId, displayName, clawName, githubHandle }, "succeeded");
     return {
@@ -661,6 +745,8 @@ async function handleAddClaw(user, text) {
         "```",
         statusSummary,
         "```",
+        "",
+        `Claude auth source: ${describeClaudeCredentialSource(userRegistry.getUser(slackId) || { credentialsDir: `persist/users/${slackId}/credentials` })}`,
       ].join("\n"),
     };
   } catch (err) {
@@ -702,6 +788,8 @@ async function handleDeleteClaw(user, text) {
     message: [
       `Delete request staged for \`${clawName}\` owned by ${targetUser.slackDisplayName || targetUser.slackUserId} (\`${targetUser.slackUserId}\`).`,
       "This will destroy the sandbox, remove the user registry entry, and delete all persist data.",
+      `Confirmation expires in ${Math.floor(DELETE_CONFIRM_TTL_MS / 60000)} minutes.`,
+      "If the bridge restarts before you confirm, the staged delete is discarded and you must run `!delete-claw` again.",
       `If you want to continue, reply with: \`!confirm-delete-claw ${clawName}\``,
     ].join("\n"),
   };
@@ -718,10 +806,14 @@ async function handleConfirmDeleteClaw(user, text) {
 
   const clawName = args[0];
   const pending = pendingDeleteRequests.get(user.slackUserId);
-  if (!pending || pending.clawName !== clawName) {
+  if (pending && Date.now() - pending.requestedAt > DELETE_CONFIRM_TTL_MS) {
+    pendingDeleteRequests.delete(user.slackUserId);
+  }
+  const activePending = pendingDeleteRequests.get(user.slackUserId);
+  if (!activePending || activePending.clawName !== clawName) {
     return {
       ok: false,
-      message: `No pending delete request found for \`${clawName}\`. Start with \`!delete-claw ${clawName}\`.`,
+      message: `No active pending delete request found for \`${clawName}\`. It may have expired or been lost during a bridge restart. Start again with \`!delete-claw ${clawName}\`.`,
     };
   }
 
@@ -729,10 +821,12 @@ async function handleConfirmDeleteClaw(user, text) {
   auditAdminAction(user, "delete-claw-confirmed", { clawName }, "started");
 
   try {
-    const purgeOutput = runAdminCommand(
-      `node bin/nemoclaw.js user-purge --sandbox '${sh(clawName)}'`,
-      600000
-    );
+    const purgeOutput = runAdminCommand(process.execPath, [
+      "bin/nemoclaw.js",
+      "user-purge",
+      "--sandbox",
+      clawName,
+    ], 600000);
     auditAdminAction(user, "delete-claw-confirmed", { clawName }, "succeeded");
     return {
       ok: true,
@@ -757,11 +851,15 @@ async function handleConfirmDeleteClaw(user, text) {
 function refreshCredentials(sandboxName, credDir = "") {
   console.log(`[refresh] Triggering credential refresh for ${sandboxName}...`);
   try {
-    const credArg = credDir ? ` --cred-dir '${sh(credDir)}'` : "";
-    execSync(
-      `"${REPO_DIR}/scripts/refresh-credentials.sh" '${sh(sandboxName)}'${credArg}`,
-      { timeout: 120000, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-    );
+    const args = [path.join(REPO_DIR, "scripts", "refresh-credentials.sh"), sandboxName];
+    if (credDir) {
+      args.push("--cred-dir", credDir);
+    }
+    execFileSync(args[0], args.slice(1), {
+      timeout: 120000,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
     console.log(`[refresh] Credentials refreshed for ${sandboxName}`);
     return true;
   } catch (err) {
@@ -966,6 +1064,19 @@ async function main() {
         return;
       }
       await reply(formatRecentAdminAudit());
+      return;
+    }
+
+    if (isAdminHelpCommand(text)) {
+      if (!user) {
+        await reply("You're not registered with NemoClaw. Ask an admin to run: `nemoclaw user-add`\nYour Slack ID: `" + event.user + "`");
+        return;
+      }
+      if (!isAdminUser(user)) {
+        await reply("You are registered, but you are not an admin user.");
+        return;
+      }
+      await reply(formatAdminHelp());
       return;
     }
 
@@ -1176,6 +1287,7 @@ module.exports = {
   isAdminAuditCommand,
   isShowClawsCommand,
   isShowUserCommand,
+  isAdminHelpCommand,
   isAddClawCommand,
   isDeleteClawCommand,
   isConfirmDeleteClawCommand,
@@ -1198,4 +1310,7 @@ module.exports = {
   formatRecentAdminAudit,
   readRecentAdminAudit,
   withAdminState,
+  formatAdminHelp,
+  getClaudeCredentialSource,
+  describeClaudeCredentialSource,
 };

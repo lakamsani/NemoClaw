@@ -23,6 +23,8 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
+SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+
 SANDBOX="${NEMOCLAW_SANDBOX:-veyonce-claw}"
 CRED_DIR=""
 GITHUB_USER=""
@@ -56,15 +58,6 @@ if [ "$ALL_USERS" = "true" ]; then
     USER_CRED_DIR=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid']['credentialsDir'])")
     USER_GITHUB=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('githubUser',''))")
     USER_NAME=$(python3 -c "import json; print(json.load(open('$USERS_FILE'))['users']['$uid'].get('slackDisplayName','$uid'))")
-
-    # Sync host Claude OAuth token to per-user cred dir (keeps persist copy fresh)
-    if [ -n "$USER_CRED_DIR" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-      FULL_CRED_DIR="$USER_CRED_DIR"
-      [[ "$FULL_CRED_DIR" != /* ]] && FULL_CRED_DIR="$REPO_DIR/$FULL_CRED_DIR"
-      if [ -f "$FULL_CRED_DIR/claude-credentials.json" ]; then
-        cp "$HOME/.claude/.credentials.json" "$FULL_CRED_DIR/claude-credentials.json"
-      fi
-    fi
 
     echo ""
     echo "================================================================"
@@ -153,23 +146,23 @@ if [ -n "$CRED_DIR" ]; then
     fi
     if [ -f "$CRED_ABS/claude-credentials.json" ]; then
       ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CRED_ABS/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-    elif [ -f "$HOME/.claude/.credentials.json" ]; then
-      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
+      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$SHARED_CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
     fi
   fi
 else
   # Legacy single-user mode: inject from host defaults
   # Claude credentials (base64 over SSH — sftp is broken in sandbox)
-  if [ -f "$HOME/.claude/.credentials.json" ]; then
+  if [ -f "$SHARED_CLAUDE_CREDS" ]; then
     ssh_cmd 'mkdir -p /sandbox/.claude'
-    base64 "$HOME/.claude/.credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-    info "Claude credentials injected"
+    base64 "$SHARED_CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+    info "Claude credentials injected (shared org fallback)"
 
     if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$HOME/.claude/.credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$SHARED_CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
     fi
   else
-    warn "No Claude credentials at ~/.claude/.credentials.json"
+    warn "No shared Claude credentials available"
   fi
 
   # Claude MCP auth cache

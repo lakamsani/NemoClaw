@@ -22,6 +22,7 @@ describe("slack-bridge-multi helpers", () => {
   it("recognizes admin commands", () => {
     expect(bridge.isListAdminsCommand("!admins")).toBe(true);
     expect(bridge.isAdminAuditCommand("!admin-audit")).toBe(true);
+    expect(bridge.isAdminHelpCommand("!admin-help")).toBe(true);
     expect(bridge.isShowClawsCommand("!show-claws")).toBe(true);
     expect(bridge.isShowUserCommand("!show-user U123ABC")).toBe(true);
     expect(bridge.isAddClawCommand("!add-claw U123ABC Jane jane-claw janedoe")).toBe(true);
@@ -182,6 +183,15 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
     expect(text).toContain("Alice (`U1`)");
     expect(text).toContain("Claw: `alice-claw`");
     expect(text).toContain("Roles: user, admin");
+    expect(text).toContain("Claude Auth:");
+  });
+
+  it("formats admin help text with delete restart guidance", () => {
+    const text = bridge.formatAdminHelp();
+    expect(text).toContain("*Admin Commands*");
+    expect(text).toContain("`!admin-help`");
+    expect(text).toContain("Delete confirmations expire after 5 minutes");
+    expect(text).toContain("lost if the bridge restarts");
   });
 
   it("builds a Slack table payload for claw inventory", () => {

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Lightweight credential refresh — proactively refreshes the Claude OAuth token
-# (if expiring soon) and re-injects it into the sandbox's openclaw.json.
+# Lightweight credential refresh — proactively refreshes the shared Claude OAuth
+# token (if expiring soon) and re-injects the selected Claude auth into the
+# sandbox's openclaw.json.
 # Run on a cron every 30 minutes.
 #
 # Usage: ./scripts/refresh-credentials.sh [sandbox-name]
@@ -53,10 +54,10 @@ fi
 # ── Proactive OAuth token refresh ─────────────────────────────────
 # Check if the host's Claude OAuth access token expires within 90 minutes.
 # If so, run a lightweight `claude -p` command which triggers Claude Code's
-# built-in token refresh, then copy the refreshed credentials to the per-user
-# cred dir (if applicable).
+# built-in token refresh for the shared org credential source.
 REFRESH_THRESHOLD_MS=5400000  # 90 minutes in milliseconds
-HOST_CREDS="$HOME/.claude/.credentials.json"
+SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+SHARED_CLAUDE_MCP_CACHE="${NEMOCLAW_SHARED_CLAUDE_MCP_CACHE:-$HOME/.claude/mcp-needs-auth-cache.json}"
 
 # Only skip OAuth refresh if ANTHROPIC_API_KEY is a real long-lived API key
 # (sk-ant-api...). OAuth access tokens (sk-ant-oat...) expire and need refresh.
@@ -66,11 +67,11 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ] && [[ "${ANTHROPIC_API_KEY}" == sk-ant-api* ]
   IS_LONG_LIVED_KEY=true
 fi
 
-if [ "$IS_LONG_LIVED_KEY" = "false" ] && [ -f "$HOST_CREDS" ]; then
+if [ "$IS_LONG_LIVED_KEY" = "false" ] && [ -f "$SHARED_CLAUDE_CREDS" ]; then
   NEEDS_REFRESH=$(python3 -c "
 import json, time, sys
 try:
-    d = json.load(open('$HOST_CREDS'))
+    d = json.load(open('$SHARED_CLAUDE_CREDS'))
     exp = d.get('claudeAiOauth', {}).get('expiresAt', 0)
     now = time.time() * 1000
     remaining = exp - now
@@ -89,7 +90,7 @@ print('no')
     # Use < /dev/null to avoid stdin warning. Retry up to 3 times.
     REFRESH_OK=false
     for attempt in 1 2 3; do
-      if timeout 45 claude -p "ok" --max-turns 1 --output-format text < /dev/null > /dev/null 2>&1; then
+    if timeout 45 claude -p "ok" --max-turns 1 --output-format text < /dev/null > /dev/null 2>&1; then
         REFRESH_OK=true
         echo "[refresh] OAuth token refreshed successfully on attempt $attempt ($(date))"
         break
@@ -99,13 +100,7 @@ print('no')
       fi
     done
 
-    if [ "$REFRESH_OK" = "true" ]; then
-      # Copy refreshed credentials to per-user cred dir
-      if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-credentials.json" ]; then
-        cp "$HOST_CREDS" "$CRED_DIR/claude-credentials.json"
-        echo "[refresh] Synced refreshed token to $CRED_DIR ($(date))"
-      fi
-    else
+    if [ "$REFRESH_OK" != "true" ]; then
       echo "[refresh] ERROR: OAuth token refresh failed after 3 attempts — token may expire soon ($(date))"
     fi
   fi
@@ -137,8 +132,15 @@ for (const pid of dirs) {
   nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
     'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &
   disown
-  sleep 5
-  ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null
+  GATEWAY_HEALTHY=false
+  for _ in $(seq 1 10); do
+    if ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null; then
+      GATEWAY_HEALTHY=true
+      break
+    fi
+    sleep 2
+  done
+  [ "$GATEWAY_HEALTHY" = "true" ]
 }
 
 # Check sandbox is reachable
@@ -149,8 +151,8 @@ CLAUDE_CREDS=""
 DESIRED_ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
 if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-credentials.json" ]; then
   CLAUDE_CREDS="$CRED_DIR/claude-credentials.json"
-elif [ -f "$HOME/.claude/.credentials.json" ]; then
-  CLAUDE_CREDS="$HOME/.claude/.credentials.json"
+elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
+  CLAUDE_CREDS="$SHARED_CLAUDE_CREDS"
 fi
 
 if [ -n "$CLAUDE_CREDS" ]; then
@@ -290,8 +292,8 @@ fi
 MCP_CACHE=""
 if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
   MCP_CACHE="$CRED_DIR/mcp-needs-auth-cache.json"
-elif [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
-  MCP_CACHE="$HOME/.claude/mcp-needs-auth-cache.json"
+elif [ -f "$SHARED_CLAUDE_MCP_CACHE" ]; then
+  MCP_CACHE="$SHARED_CLAUDE_MCP_CACHE"
 fi
 if [ -n "$MCP_CACHE" ]; then
   base64 "$MCP_CACHE" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
