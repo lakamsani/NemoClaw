@@ -124,6 +124,14 @@ extract_anthropic_key() {
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     return
   fi
+  if [ -f /sandbox/.env ]; then
+    ANTHROPIC_API_KEY="$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' /sandbox/.env 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  fi
+  if [ -n "$ANTHROPIC_API_KEY" ]; then
+    export ANTHROPIC_API_KEY
+    echo "[credentials] ANTHROPIC_API_KEY loaded from CLAUDE_CODE_OAUTH_TOKEN in /sandbox/.env"
+    return
+  fi
   ANTHROPIC_API_KEY="$(python3 - <<'PYKEY'
 import json, os
 cred_path = os.path.expanduser('~/.claude/.credentials.json')
@@ -346,7 +354,6 @@ inject_slack_webhook
 inject_gog_keyring_password
 write_auth_profile
 export CHAT_UI_URL PUBLIC_PORT
-fix_openclaw_config
 update_anthropic_apikey_in_config
 openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
 

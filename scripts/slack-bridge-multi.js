@@ -368,7 +368,7 @@ function buildAuthRecoveryMessage(user) {
 }
 
 function requestLikelyNeedsMcp(text) {
-  return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b|\bticket\b|\btask\b|\bsprint\b|\bbacklog\b|\bboard\b|\bassigned\b/i.test(String(text || ""));
+  return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b|\bticket\b|\btask\b|\bsprint\b|\bbacklog\b|\bboard\b|\bassigned\b|\bcalendar\b|\bevent\b|\bmeeting\b|\bgmail\b|\bemail\b|\binbox\b|\bgoogle\b|\bdocs\b|\bdrive\b/i.test(String(text || ""));
 }
 
 function listConfiguredCredentials(user) {

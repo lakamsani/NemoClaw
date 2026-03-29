@@ -166,12 +166,16 @@ function setupClaudeToken(user, token) {
   const credDir = resolvePath(user.credentialsDir);
   fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(credDir, "claude-oauth-token.txt"), token, { mode: 0o600 });
+  try {
+    fs.rmSync(path.join(credDir, "claude-credentials.json"), { force: true });
+  } catch {}
 
   try {
     sshCmd(user.sandboxName,
       `grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${token}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${token}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
     sshCmd(user.sandboxName,
       `grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${token}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${token}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
+    sshCmd(user.sandboxName, "rm -f /sandbox/.claude/.credentials.json");
   } catch {}
 
   try {

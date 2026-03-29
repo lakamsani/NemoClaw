@@ -106,8 +106,16 @@ if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-credentials.json" ]; then
 fi
 
 if [ -n "$CLAUDE_CREDS" ]; then
-  base64 "$CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  DESIRED_ANTHROPIC_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  if [ -z "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
+    base64 "$CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+    DESIRED_ANTHROPIC_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  else
+    ssh_cmd 'rm -f /sandbox/.claude/.credentials.json'
+  fi
+fi
+
+if [ -n "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
+  ssh_cmd 'rm -f /sandbox/.claude/.credentials.json'
 fi
 
 # Re-inject Anthropic API key if stored separately (per-user)

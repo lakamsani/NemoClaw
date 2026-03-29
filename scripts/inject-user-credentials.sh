@@ -97,6 +97,7 @@ if [ -f "$CRED_DIR/claude-oauth-token.txt" ]; then
   CLAUDE_OAUTH_TOKEN="$(cat "$CRED_DIR/claude-oauth-token.txt")"
   ssh_cmd "grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
   ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${CLAUDE_OAUTH_TOKEN}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${CLAUDE_OAUTH_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  ssh_cmd 'rm -f /sandbox/.claude/.credentials.json'
   patch_claude_runtime "$CLAUDE_OAUTH_TOKEN"
   info "Claude long-lived token injected (per-user)"
 fi
@@ -104,11 +105,13 @@ fi
 # ── Claude Code credentials ──────────────────────────────────────
 if [ -f "$CRED_DIR/claude-credentials.json" ]; then
   base64 "$CRED_DIR/claude-credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  CLAUDE_ACCESS_TOKEN="$(python3 -c "import json; d=json.load(open('$CRED_DIR/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-  if [ -n "$CLAUDE_ACCESS_TOKEN" ]; then
-    ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  if [ ! -f "$CRED_DIR/claude-oauth-token.txt" ]; then
+    CLAUDE_ACCESS_TOKEN="$(python3 -c "import json; d=json.load(open('$CRED_DIR/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+    if [ -n "$CLAUDE_ACCESS_TOKEN" ]; then
+      ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+    fi
+    patch_claude_runtime "$CLAUDE_ACCESS_TOKEN"
   fi
-  patch_claude_runtime "$CLAUDE_ACCESS_TOKEN"
   info "Claude credentials injected (per-user)"
 elif [ ! -f "$CRED_DIR/claude-oauth-token.txt" ]; then
   warn "No per-user Claude credentials found"

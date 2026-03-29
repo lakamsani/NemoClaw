@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const { execFileSync, spawnSync } = require("child_process");
+const { execFileSync, execSync, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -22,7 +22,7 @@ const YW = _useColor ? "\x1b[1;33m" : "";
 
 const { ROOT, SCRIPTS, run, runCapture: _runCapture, runInteractive, shellQuote, validateName } = require("./lib/runner");
 const { resolveOpenshell } = require("./lib/resolve-openshell");
-const { startGatewayForRecovery } = require("./lib/onboard");
+const { startGatewayForRecovery, pruneStaleSandboxEntry } = require("./lib/onboard");
 const {
   ensureApiKey,
   ensureGithubToken,
@@ -573,6 +573,50 @@ function listSandboxes() {
 
 async function userAdd(args = []) {
   const { prompt: askPrompt } = require("./lib/credentials");
+  const applyDefaultPolicies = async (sandboxNameForPolicies) => {
+    const defaultPresets = ["npm", "pypi", "slack"];
+    const allPresets = policies.listPresets();
+    const knownNames = new Set(allPresets.map((p) => p.name));
+
+    console.log("");
+    console.log("  Available policy presets:");
+    allPresets.forEach((p) => {
+      const suggested = defaultPresets.includes(p.name) ? " (default)" : "";
+      console.log(`    ○ ${p.name} — ${p.description}${suggested}`);
+    });
+    console.log("");
+
+    let selectedPresets = defaultPresets;
+    if (nonInteractive) {
+      console.log(`  [non-interactive] Applying default presets: ${defaultPresets.join(", ")}`);
+    } else {
+      const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
+
+      if (presetAnswer.toLowerCase() === "n") {
+        selectedPresets = [];
+        console.log("  Skipping policy presets.");
+      } else if (presetAnswer.toLowerCase() === "list") {
+        const picks = await askPrompt("  Enter preset names (comma-separated): ");
+        selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
+        const invalid = selectedPresets.filter((n) => !knownNames.has(n));
+        if (invalid.length > 0) {
+          console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
+          selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
+        }
+      }
+    }
+
+    for (const preset of selectedPresets) {
+      try {
+        policies.applyPreset(sandboxNameForPolicies, preset);
+      } catch (err) {
+        console.error(`  Warning: failed to apply preset '${preset}': ${err.message}`);
+      }
+    }
+    if (selectedPresets.length > 0) {
+      console.log(`  Applied presets: ${selectedPresets.join(", ")}`);
+    }
+  };
 
   // Parse --non-interactive mode with named args
   const nonInteractive = args.includes("--non-interactive");
@@ -619,7 +663,22 @@ async function userAdd(args = []) {
   const githubUser = nonInteractive ? (argGithubUser || "") : await askPrompt("  GitHub username (optional, press Enter to skip): ");
 
   // Check if sandbox exists or needs to be created
-  const sbExists = registry.getSandbox(sandboxName);
+  let sbExists = registry.getSandbox(sandboxName);
+  const liveExists = pruneStaleSandboxEntry(sandboxName);
+  sbExists = registry.getSandbox(sandboxName);
+  if (!sbExists && liveExists) {
+    registry.registerSandbox({
+      name: sandboxName,
+      model: "anthropic/claude-sonnet-4-6",
+      provider: "openshell",
+      gpuEnabled: false,
+      policies: [],
+    });
+    sbExists = registry.getSandbox(sandboxName);
+    console.log(`  Found existing live sandbox '${sandboxName}'. Adopting it into the local registry.`);
+    await applyDefaultPolicies(sandboxName);
+  }
+
   if (!sbExists) {
     const create = nonInteractive ? "y" : await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
     if (create.toLowerCase() !== "n") {
@@ -632,7 +691,7 @@ async function userAdd(args = []) {
       execSync(`cp -r "${path.join(ROOT, "nemoclaw")}" "${buildCtx}/nemoclaw"`, { stdio: "inherit" });
       execSync(`cp -r "${path.join(ROOT, "nemoclaw-blueprint")}" "${buildCtx}/nemoclaw-blueprint"`, { stdio: "inherit" });
       execSync(`cp -r "${path.join(ROOT, "scripts")}" "${buildCtx}/scripts"`, { stdio: "inherit" });
-      execSync(`rm -rf "${buildCtx}/nemoclaw/node_modules" "${buildCtx}/nemoclaw/src"`, { stdio: "ignore" });
+      execSync(`rm -rf "${buildCtx}/nemoclaw/node_modules"`, { stdio: "ignore" });
 
       const basePolicyPath = path.join(ROOT, "nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml");
       const envArgs = [];
@@ -658,51 +717,7 @@ async function userAdd(args = []) {
         policies: [],
       });
       console.log(`  Sandbox '${sandboxName}' created and registered.`);
-
-      // Apply default policy presets (matching veyonce-claw: npm, pypi, slack)
-      const policies = require("./lib/policies");
-      const defaultPresets = ["npm", "pypi", "slack"];
-      const allPresets = policies.listPresets();
-      const knownNames = new Set(allPresets.map((p) => p.name));
-
-      console.log("");
-      console.log("  Available policy presets:");
-      allPresets.forEach((p) => {
-        const suggested = defaultPresets.includes(p.name) ? " (default)" : "";
-        console.log(`    ○ ${p.name} — ${p.description}${suggested}`);
-      });
-      console.log("");
-
-      let selectedPresets = defaultPresets;
-      if (nonInteractive) {
-        console.log(`  [non-interactive] Applying default presets: ${defaultPresets.join(", ")}`);
-      } else {
-        const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
-
-        if (presetAnswer.toLowerCase() === "n") {
-          selectedPresets = [];
-          console.log("  Skipping policy presets.");
-        } else if (presetAnswer.toLowerCase() === "list") {
-          const picks = await askPrompt("  Enter preset names (comma-separated): ");
-          selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
-          const invalid = selectedPresets.filter((n) => !knownNames.has(n));
-          if (invalid.length > 0) {
-            console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
-            selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
-          }
-        }
-      }
-
-      for (const preset of selectedPresets) {
-        try {
-          policies.applyPreset(sandboxName, preset);
-        } catch (err) {
-          console.error(`  Warning: failed to apply preset '${preset}': ${err.message}`);
-        }
-      }
-      if (selectedPresets.length > 0) {
-        console.log(`  Applied presets: ${selectedPresets.join(", ")}`);
-      }
+      await applyDefaultPolicies(sandboxName);
     }
   }
 
