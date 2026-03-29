@@ -127,7 +127,7 @@ extract_anthropic_key() {
   if [ -f /sandbox/.env ]; then
     ANTHROPIC_API_KEY="$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' /sandbox/.env 2>/dev/null | tail -1 | cut -d= -f2- || true)"
   fi
-  if [ -n "$ANTHROPIC_API_KEY" ]; then
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     export ANTHROPIC_API_KEY
     echo "[credentials] ANTHROPIC_API_KEY loaded from CLAUDE_CODE_OAUTH_TOKEN in /sandbox/.env"
     return
@@ -144,7 +144,7 @@ except Exception:
     pass
 PYKEY
 )"
-  if [ -n "$ANTHROPIC_API_KEY" ]; then
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     export ANTHROPIC_API_KEY
     echo "[credentials] ANTHROPIC_API_KEY extracted from Claude credentials"
   fi
