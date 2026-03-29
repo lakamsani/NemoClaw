@@ -704,6 +704,27 @@ function formatAddClawUsage() {
   return "Usage: `!add-claw <slack_id> <display_name> <claw_name> <github_handle>`\nExample: `!add-claw U12345ABC \"Jane Doe\" jane-claw janedoe`";
 }
 
+function buildAddClawSuccessMessage({ slackId, displayName, clawName, githubHandle, userAddOutput = "", resilienceOutput = "", statusSummary = "", warningOutput = "" }) {
+  const sections = [
+    `Created claw \`${clawName}\` for ${displayName} (\`${slackId}\`).`,
+    `GitHub: \`${githubHandle}\``,
+  ];
+  if (userAddOutput.trim()) {
+    sections.push("", "*user-add output*", "```", userAddOutput.trim().slice(-2500), "```");
+  }
+  if (resilienceOutput.trim()) {
+    sections.push("", "*resilience output*", "```", resilienceOutput.trim().slice(-2500), "```");
+  }
+  if (statusSummary.trim()) {
+    sections.push("", "*verification*", "```", statusSummary, "```");
+  }
+  if (warningOutput.trim()) {
+    sections.push("", "*warning*", "```", warningOutput.trim().slice(-2500), "```");
+  }
+  sections.push("", `Claude auth source: ${describeClaudeCredentialSource(userRegistry.getUser(slackId) || { credentialsDir: `persist/users/${slackId}/credentials` })}`);
+  return sections.join("\n");
+}
+
 async function handleAddClaw(user, text) {
   const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   if (args.length < 4) {
@@ -761,30 +782,28 @@ async function handleAddClaw(user, text) {
     auditAdminAction(user, "add-claw", { slackId, displayName, clawName, githubHandle }, "succeeded");
     return {
       ok: true,
-      message: [
-        `Created claw \`${clawName}\` for ${displayName} (\`${slackId}\`).`,
-        `GitHub: \`${githubHandle}\``,
-        "",
-        "*user-add output*",
-        "```",
-        userAddOutput.trim().slice(-2500) || "(no output)",
-        "```",
-        "",
-        "*resilience output*",
-        "```",
-        resilienceOutput.trim().slice(-2500) || "(no output)",
-        "```",
-        "",
-        "*verification*",
-        "```",
-        statusSummary,
-        "```",
-        "",
-        `Claude auth source: ${describeClaudeCredentialSource(userRegistry.getUser(slackId) || { credentialsDir: `persist/users/${slackId}/credentials` })}`,
-      ].join("\n"),
+      message: buildAddClawSuccessMessage({ slackId, displayName, clawName, githubHandle, userAddOutput, resilienceOutput, statusSummary }),
     };
   } catch (err) {
     const output = `${err.stdout || ""}${err.stderr || ""}`.trim() || err.message;
+    const createdUser = userRegistry.getUser(slackId);
+    const liveSandbox = loadLiveSandboxMap().get(clawName);
+    const sandboxReady = liveSandbox?.phase === "Ready";
+    if (createdUser?.sandboxName === clawName && sandboxReady) {
+      const statusSummary = getProvisioningSummary(slackId, clawName);
+      auditAdminAction(user, "add-claw", { slackId, displayName, clawName, githubHandle }, "succeeded-with-warning", output.slice(0, 1000));
+      return {
+        ok: true,
+        message: buildAddClawSuccessMessage({
+          slackId,
+          displayName,
+          clawName,
+          githubHandle,
+          statusSummary,
+          warningOutput: `Provisioning completed, but an intermediate step returned a noisy error.\n${output}`,
+        }),
+      };
+    }
     auditAdminAction(user, "add-claw", { slackId, displayName, clawName, githubHandle }, "failed", output.slice(0, 1000));
     return {
       ok: false,
