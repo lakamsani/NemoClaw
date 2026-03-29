@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "6ef62fb533db",
+  "strategy": "manual-commit",
+  "branch": "multi-user-claude",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "bin/lib/credential-setup.js",
+    "scripts/refresh-credentials.sh"
+  ],
+  "sessions": [
+    {
+      "metadata": "/6e/f62fb533db/0/metadata.json",
+      "transcript": "/6e/f62fb533db/0/full.jsonl",
+      "content_hash": "/6e/f62fb533db/0/content_hash.txt",
+      "prompt": "/6e/f62fb533db/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 197,
+    "cache_creation_tokens": 399155,
+    "cache_read_tokens": 13189561,
+    "output_tokens": 37683,
+    "api_call_count": 147
+  }
+}
