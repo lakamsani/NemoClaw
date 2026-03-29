@@ -1,0 +1,103 @@
+review latest changes done in this repo by "codex" , criquue and suggest any improvements. After that wait for my approval before pushing to remote.
+
+---
+
+save critique and summary deails to a markdown file called claude-critque.md . no need to fix any of them yet or push.
+
+---
+
+push the current changes to remote. push the "entire" checkpoint branch as well.
+
+---
+
+what is "entire/81a52ef-79de9a" for? delete it from remote for sure.
+
+---
+
+print all the additional commands available to admin users
+
+---
+
+what is considered an admin-audit entry?
+
+---
+
+some of the suggestions you had in claude-critique.md  have been fixed by codex. please review again.
+
+---
+
+push these changes to remote
+
+---
+
+getting error "Error: sh is not defined" when i just asked the slack bot to add a new tak to google calendar
+
+---
+
+stll same error do we need to restart slack bridge?
+
+---
+
+this is the nemoclaw tmux session
+
+---
+
+just kill it and restart
+
+---
+
+these fixes are working well from slack bot. ccmmit and push
+
+---
+
+check why frehrelease mcp isnt comfigured on claude code. it worked before
+
+---
+
+yes. here us the mcp repo. ensure claude code on all sandboxes has this. i and other users will suply our api tokens via slack. https://github.com/dasscoax/freshrelease_mcp use freshworks.freshrelese.com as thr server
+
+---
+
+what is vitest in node.js testing
+
+---
+
+what is HMR
+
+---
+
+3
+
+---
+
+we made many changes to ensure that macbook users provide their own long lived Claude Team anthropic API keys (instead of using a shared one). If that key doesn't work initially then fallback to shared Nvidia build key. For some reason with all those fixes we still can't get a freshrelease query to work via slackbot. Here is the slackbox chat log and error. Suggest possible fixes. 
+vamsee.lakamsani  [7:56 PM]
+List most recent Freshrelease epics for platform not in completed or in progress state . Platform EPICs has one of the following prefixes.
+BILLING, CH, ED, EMAIL, ESTR, FRESHID, IRIS, KA, MP, RTS, SEARCH, SIPC, WA, WHFreshworks Nemo Claw  [7:56 PM]
+Agent exited with code 1. (node:245355) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use node --trace-warnings ... to show where the warning was created)
+[plugins] plugins.allow is empty; discovered non-bundled plugins may auto-load: nemoclaw (/sandbox/.openclaw/extensions/nemoclaw/dist/index.js). Set plugins.allow to explicit trusted ids.
+[diagnostic] lane task error: lane=main durationMs=951 error="FailoverError: Unknown model: inference/meta/llama-3.3-70b-instruct"
+[d (edited)
+
+---
+
+codex fixed all the problems with a per user anthropic key. review the last commit + local changes and provide a crtique.
+
+---
+
+go ahead and fix those. For 8, we need OAuth based approach to work for linux users. add back that cron login for any linux users that decides to go with Oauth approach.
+
+---
+
+undo changes related to this issue: 
+P1 selectInferenceRoute missing: disagree. That point is stale or based on an incomplete diff. selectInferenceRoute is defined in scripts/slack-bridge-
+     multi.js and is one of the areas that should be reviewed, but it is not missing.
+
+---
+
+what are the code changes to be pushed?
+
+---
+
+I want to use Agent Teams feature. So please enable the required setting https://code.claude.com/docs/en/agent-teams
