@@ -65,20 +65,28 @@ ssh_cmd() {
 
 patch_claude_runtime() {
   local anthropic_key="${1:-}"
-  ssh_cmd "python3 -c \"
-import json, os
+  local script
+  script=$(cat <<'PYSCRIPT'
+import base64, json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
 if not os.path.exists(path):
     raise SystemExit(0)
+key = base64.b64decode(os.environ.get('ANTHROPIC_KEY_B64', '')).decode() if os.environ.get('ANTHROPIC_KEY_B64') else ''
 cfg = json.load(open(path))
 providers = cfg.setdefault('models', {}).setdefault('providers', {})
 anthropic = providers.get('anthropic')
-if isinstance(anthropic, dict) and '${anthropic_key}':
-    anthropic['apiKey'] = '${anthropic_key}'
+if isinstance(anthropic, dict) and key:
+    anthropic['apiKey'] = key
 cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
-\"" 2>/dev/null
+PYSCRIPT
+)
+  local b64_script
+  local b64_key
+  b64_script="$(printf '%s' "$script" | base64 -w0)"
+  b64_key="$(printf '%s' "$anthropic_key" | base64 -w0)"
+  ssh_cmd "ANTHROPIC_KEY_B64='$b64_key' base64 -d <<< '$b64_script' | python3" 2>/dev/null
 }
 
 # Ensure target directories exist

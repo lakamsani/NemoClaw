@@ -350,8 +350,8 @@ function buildAuthRecoveryMessage(user) {
   if (source.mode === "per-user") {
     return [
       "Anthropic authentication is still failing after retry.",
-      "Your sandbox is using per-user Claude OAuth credentials, and those tokens cannot be auto-refreshed by the bridge.",
-      "Run `!setup claude <fresh ~/.claude/.credentials.json>` with a newly refreshed Claude login.",
+      "Your sandbox is using per-user Claude OAuth credentials, and those tokens are not auto-refreshed by the bridge.",
+      "Run `claude` on your machine to refresh the login, then `!setup claude <fresh ~/.claude/.credentials.json>`. Or switch to `!setup claude-token` for a more durable auth method.",
     ].join("\n");
   }
   if (source.mode === "long-lived-token") {
@@ -368,7 +368,7 @@ function buildAuthRecoveryMessage(user) {
 }
 
 function requestLikelyNeedsMcp(text) {
-  return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b/i.test(String(text || ""));
+  return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b|\bticket\b|\btask\b|\bsprint\b|\bbacklog\b|\bboard\b|\bassigned\b/i.test(String(text || ""));
 }
 
 function listConfiguredCredentials(user) {
@@ -903,17 +903,29 @@ function refreshCredentials(sandboxName, credDir = "") {
 }
 
 function getRuntimeFallbackModels(sandboxName) {
+  const script = Buffer.from(
+    `import json, os\n` +
+    `path=os.path.expanduser('~/.openclaw/openclaw.json')\n` +
+    `try:\n    cfg=json.load(open(path))\nexcept Exception:\n    print('{}')\n    raise SystemExit(0)\n` +
+    `providers=((cfg.get('models') or {}).get('providers') or {})\n` +
+    `out={}\n` +
+    `for name in ('nvidia','ollama','inference'):\n` +
+    `    val=providers.get(name)\n` +
+    `    if isinstance(val, dict):\n` +
+    `        models=val.get('models') or []\n` +
+    `        mids=[m.get('id') for m in models if isinstance(m, dict) and m.get('id')]\n` +
+    `        if mids:\n            out[name]=mids\n` +
+    `print(json.dumps(out))\n`
+  ).toString("base64");
+
   try {
     const sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
     const confPath = `/tmp/nemoclaw-fallback-${sandboxName}.conf`;
     fs.writeFileSync(confPath, sshConfig);
     try {
       const raw = execFileSync("ssh", [
-        "-T",
-        "-F",
-        confPath,
-        `openshell-${sandboxName}`,
-        "python3 - <<'PY'\nimport json, os\npath=os.path.expanduser('~/.openclaw/openclaw.json')\ntry:\n    cfg=json.load(open(path))\nexcept Exception:\n    print('{}')\n    raise SystemExit(0)\nproviders=((cfg.get('models') or {}).get('providers') or {})\nout={}\nfor name in ('nvidia','ollama','inference'):\n    val=providers.get(name)\n    if isinstance(val, dict):\n        models=val.get('models') or []\n        mids=[m.get('id') for m in models if isinstance(m, dict) and m.get('id')]\n        if mids:\n            out[name]=mids\nprint(json.dumps(out))\nPY",
+        "-T", "-F", confPath, `openshell-${sandboxName}`,
+        `echo '${script}' | base64 -d | python3`,
       ], {
         encoding: "utf-8",
         timeout: 30000,
@@ -958,25 +970,26 @@ function syncSandboxSelectionConfig(user, provider, model) {
   const selectionConfig = getProviderSelectionConfig(provider, model);
   if (!selectionConfig) return;
   const sandboxName = user.sandboxName;
+  const cfgPayload = Buffer.from(JSON.stringify({ ...selectionConfig, onboardedAt: new Date().toISOString() })).toString("base64");
+  const script = Buffer.from(
+    `import json, os\n` +
+    `import base64\n` +
+    `path = os.path.expanduser('~/.nemoclaw/config.json')\n` +
+    `os.makedirs(os.path.dirname(path), exist_ok=True)\n` +
+    `cfg = json.loads(base64.b64decode(${JSON.stringify(cfgPayload)}).decode())\n` +
+    `json.dump(cfg, open(path, 'w'), indent=2)\n`
+  ).toString("base64");
+
   let sshConfig;
   try {
     sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
   } catch {
     return;
   }
-  const confPath = `/tmp/nemoclaw-sync-${sandboxName}-${Date.now()}.conf`;
+  const confPath = `/tmp/nemoclaw-sync-${sandboxName}-${process.pid}-${Date.now()}.conf`;
   fs.writeFileSync(confPath, sshConfig);
-  const remoteScript = [
-    "python3 - <<'PY'",
-    "import json, os",
-    "path = os.path.expanduser('~/.nemoclaw/config.json')",
-    "os.makedirs(os.path.dirname(path), exist_ok=True)",
-    `cfg = ${JSON.stringify(JSON.stringify({ ...selectionConfig, onboardedAt: new Date().toISOString() }))}`,
-    "json.dump(json.loads(cfg), open(path, 'w'), indent=2)",
-    "PY",
-  ].join("\n");
   try {
-    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, remoteScript], {
+    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, `echo '${script}' | base64 -d | python3`], {
       encoding: "utf-8",
       timeout: 30000,
       stdio: ["ignore", "pipe", "pipe"],
@@ -986,32 +999,36 @@ function syncSandboxSelectionConfig(user, provider, model) {
   }
 }
 
+const _primaryModelCache = new Map();
+
 function setSandboxPrimaryModel(user, primaryModelRef) {
   const sandboxName = user.sandboxName;
+  if (_primaryModelCache.get(sandboxName) === primaryModelRef) return;
+
+  const script = Buffer.from(
+    `import json, os\n` +
+    `path = os.path.expanduser('~/.openclaw/openclaw.json')\n` +
+    `cfg = json.load(open(path))\n` +
+    `cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = ${JSON.stringify(primaryModelRef)}\n` +
+    `json.dump(cfg, open(path, 'w'), indent=2)\n` +
+    `os.chmod(path, 0o600)\n`
+  ).toString("base64");
+
   let sshConfig;
   try {
     sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
   } catch {
     return;
   }
-  const confPath = `/tmp/nemoclaw-primary-${sandboxName}-${Date.now()}.conf`;
+  const confPath = `/tmp/nemoclaw-primary-${sandboxName}-${process.pid}-${Date.now()}.conf`;
   fs.writeFileSync(confPath, sshConfig);
-  const remoteScript = [
-    "python3 - <<'PY'",
-    "import json, os",
-    "path = os.path.expanduser('~/.openclaw/openclaw.json')",
-    "cfg = json.load(open(path))",
-    `cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = ${JSON.stringify(primaryModelRef)}`,
-    "json.dump(cfg, open(path, 'w'), indent=2)",
-    "os.chmod(path, 0o600)",
-    "PY",
-  ].join("\n");
   try {
-    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, remoteScript], {
+    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, `echo '${script}' | base64 -d | python3`], {
       encoding: "utf-8",
       timeout: 30000,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    _primaryModelCache.set(sandboxName, primaryModelRef);
   } finally {
     try { fs.unlinkSync(confPath); } catch {}
   }
@@ -1042,6 +1059,49 @@ function selectInferenceRoute(user, provider, model) {
     setSandboxPrimaryModel(user, `ollama/${model}`);
   } else if (provider === "anthropic-prod") {
     setSandboxPrimaryModel(user, `anthropic/${model}`);
+  }
+}
+
+// ── Fallback routing on auth failure ─────────────────────────────
+
+async function attemptFallbackRouting(user, text, baseSessionId, channel, displayName) {
+  if (requestLikelyNeedsMcp(text)) {
+    return `${buildAuthRecoveryMessage(user)}\n\nThis request appears to require Freshrelease/MCP tooling. NVIDIA fallback is available for plain text generation, but it is not reliable for this tool-driven workflow.`;
+  }
+
+  const fallbackModels = getRuntimeFallbackModels(user.sandboxName);
+  console.log(`[${channel}] fallback models for ${user.sandboxName}:`, fallbackModels);
+
+  try {
+    if (fallbackModels.nvidia) {
+      selectInferenceRoute(user, "nvidia-nim", fallbackModels.nvidia);
+      const nvidiaResponse = await runAgentInSandbox(text, `${baseSessionId}-nvidia`, user, { skipClaudeAuth: true });
+      console.log(`[${channel}] ${user.sandboxName} → ${displayName} (nvidia fallback): ${nvidiaResponse.slice(0, 100)}...`);
+      if (!AUTH_ERROR_RE.test(nvidiaResponse) && !/Unknown model:/i.test(nvidiaResponse)) {
+        return `[fallback: NVIDIA Nemotron]\n${nvidiaResponse}`;
+      }
+
+      if (fallbackModels.ollama) {
+        selectInferenceRoute(user, "ollama-local", fallbackModels.ollama);
+        const ollamaResponse = await runAgentInSandbox(text, `${baseSessionId}-ollama`, user, { skipClaudeAuth: true });
+        console.log(`[${channel}] ${user.sandboxName} → ${displayName} (ollama fallback): ${ollamaResponse.slice(0, 100)}...`);
+        if (!AUTH_ERROR_RE.test(ollamaResponse) && !/Unknown model:/i.test(ollamaResponse)) {
+          return `[fallback: local Ollama]\n${ollamaResponse}`;
+        }
+        return `${buildAuthRecoveryMessage(user)}\n\nNVIDIA and Ollama fallbacks also did not recover this request.`;
+      }
+      return `${buildAuthRecoveryMessage(user)}\n\nNVIDIA fallback did not recover this request, and no Ollama model is configured in the sandbox runtime.`;
+    }
+    return `${buildAuthRecoveryMessage(user)}\n\nNo NVIDIA fallback model is configured in the sandbox runtime.`;
+  } catch (fallbackErr) {
+    return `${buildAuthRecoveryMessage(user)}\n\nFallback routing failed: ${fallbackErr.message}`;
+  } finally {
+    try {
+      syncSandboxSelectionConfig(user, "anthropic-prod", "claude-sonnet-4-6");
+      setSandboxPrimaryModel(user, "anthropic/claude-sonnet-4-6");
+    } catch (restoreErr) {
+      console.error(`[${channel}] failed to restore Anthropic route for ${user.sandboxName}: ${restoreErr.message}`);
+    }
   }
 }
 
@@ -1418,54 +1478,7 @@ async function main() {
           console.log(`[${channel}] ${user.sandboxName} → ${displayName} (retry): ${response.slice(0, 100)}...`);
         }
         if (AUTH_ERROR_RE.test(response)) {
-          if (requestLikelyNeedsMcp(text)) {
-            response = `${buildAuthRecoveryMessage(user)}\n\nThis request appears to require Freshrelease/MCP tooling. NVIDIA fallback is available for plain text generation, but it is not reliable for this tool-driven workflow.`;
-          } else {
-          const fallbackModels = getRuntimeFallbackModels(user.sandboxName);
-          console.log(`[${channel}] fallback models for ${user.sandboxName}:`, fallbackModels);
-          try {
-            if (fallbackModels.nvidia) {
-              selectInferenceRoute(user, "nvidia-nim", fallbackModels.nvidia);
-              const nvidiaResponse = await runAgentInSandbox(
-                text,
-                `${event.user}-${channel}-${Date.now()}-nvidia`,
-                user,
-                { skipClaudeAuth: true }
-              );
-              console.log(`[${channel}] ${user.sandboxName} → ${displayName} (nvidia fallback): ${nvidiaResponse.slice(0, 100)}...`);
-              if (!AUTH_ERROR_RE.test(nvidiaResponse) && !/Unknown model:/i.test(nvidiaResponse)) {
-                response = `[fallback: NVIDIA Nemotron]\n${nvidiaResponse}`;
-              } else if (fallbackModels.ollama) {
-                selectInferenceRoute(user, "ollama-local", fallbackModels.ollama);
-                const ollamaResponse = await runAgentInSandbox(
-                  text,
-                  `${event.user}-${channel}-${Date.now()}-ollama`,
-                  user,
-                  { skipClaudeAuth: true }
-                );
-                console.log(`[${channel}] ${user.sandboxName} → ${displayName} (ollama fallback): ${ollamaResponse.slice(0, 100)}...`);
-                if (!AUTH_ERROR_RE.test(ollamaResponse) && !/Unknown model:/i.test(ollamaResponse)) {
-                  response = `[fallback: local Ollama]\n${ollamaResponse}`;
-                } else {
-                  response = `${buildAuthRecoveryMessage(user)}\n\nNVIDIA and Ollama fallbacks also did not recover this request.`;
-                }
-              } else {
-                response = `${buildAuthRecoveryMessage(user)}\n\nNVIDIA fallback did not recover this request, and no Ollama model is configured in the sandbox runtime.`;
-              }
-            } else {
-              response = `${buildAuthRecoveryMessage(user)}\n\nNo NVIDIA fallback model is configured in the sandbox runtime.`;
-            }
-          } catch (fallbackErr) {
-            response = `${buildAuthRecoveryMessage(user)}\n\nFallback routing failed: ${fallbackErr.message}`;
-          } finally {
-            try {
-              syncSandboxSelectionConfig(user, "anthropic-prod", "claude-sonnet-4-6");
-              setSandboxPrimaryModel(user, "anthropic/claude-sonnet-4-6");
-            } catch (restoreErr) {
-              console.error(`[${channel}] failed to restore Anthropic route for ${user.sandboxName}: ${restoreErr.message}`);
-            }
-          }
-          }
+          response = await attemptFallbackRouting(user, text, `${event.user}-${channel}-${Date.now()}`, channel, displayName);
         }
       }
 
