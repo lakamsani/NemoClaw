@@ -332,9 +332,9 @@ for (const pid of dirs) {
 }
 "' 2>/dev/null || true
 sleep 2
-# Remove root-owned cron/session files before gateway restart recreates them
-# (gateway runs as root inside sandbox, creating files sandbox user can't access)
-ssh_cmd 'find /sandbox/.openclaw/cron /sandbox/.openclaw/agents -user root -delete 2>/dev/null' 2>/dev/null || true
+# Preserve cron jobs and agent state across restarts. Repair ownership instead
+# of deleting root-owned files so installed heartbeat jobs survive.
+ssh_cmd 'chown -R sandbox:sandbox /sandbox/.openclaw/cron /sandbox/.openclaw/agents 2>/dev/null' 2>/dev/null || true
 # Start gateway in a separate SSH session that stays alive
 # Use nohup + disown so the SSH session survives parent shell exit (e.g. cron)
 nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \

@@ -73,7 +73,9 @@ for (const pid of dirs) {
 }
 "' 2>/dev/null || true
   sleep 2
-  ssh_cmd 'find /sandbox/.openclaw/cron /sandbox/.openclaw/agents -user root -delete 2>/dev/null' 2>/dev/null || true
+  # Preserve cron jobs and agent state across restarts. Older restarts deleted
+  # any root-owned files here, which could wipe installed heartbeat jobs.
+  ssh_cmd 'chown -R sandbox:sandbox /sandbox/.openclaw/cron /sandbox/.openclaw/agents 2>/dev/null' 2>/dev/null || true
   nohup ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "openshell-${SANDBOX}" \
     'export HOME=/sandbox; openclaw gateway run >> /tmp/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &
   disown
