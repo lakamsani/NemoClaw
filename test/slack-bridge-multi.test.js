@@ -22,12 +22,69 @@ describe("slack-bridge-multi helpers", () => {
   it("recognizes admin commands", () => {
     expect(bridge.isListAdminsCommand("!admins")).toBe(true);
     expect(bridge.isAdminAuditCommand("!admin-audit")).toBe(true);
+    expect(bridge.isAdminAuditCommand("!admin audit")).toBe(true);
     expect(bridge.isAdminHelpCommand("!admin-help")).toBe(true);
+    expect(bridge.isAdminHelpCommand("!admin help")).toBe(true);
     expect(bridge.isShowClawsCommand("!show-claws")).toBe(true);
+    expect(bridge.isShowClawsCommand("!show claws")).toBe(true);
     expect(bridge.isShowUserCommand("!show-user U123ABC")).toBe(true);
+    expect(bridge.isShowUserCommand("!show user U123ABC")).toBe(true);
     expect(bridge.isAddClawCommand("!add-claw U123ABC Jane jane-claw janedoe")).toBe(true);
+    expect(bridge.isAddClawCommand("!add claw U123ABC Jane jane-claw janedoe")).toBe(true);
     expect(bridge.isDeleteClawCommand("!delete-claw jane-claw")).toBe(true);
+    expect(bridge.isDeleteClawCommand("!delete claw jane-claw")).toBe(true);
     expect(bridge.isConfirmDeleteClawCommand("!confirm-delete-claw jane-claw")).toBe(true);
+    expect(bridge.isConfirmDeleteClawCommand("!confirm delete claw jane-claw")).toBe(true);
+  });
+
+  it("canonicalizes spaced admin commands and detects admin-like typos", () => {
+    expect(bridge.canonicalizeAdminCommand("!show claws ready")).toBe("!show-claws ready");
+    expect(bridge.canonicalizeAdminCommand("!confirm delete claw alice-claw")).toBe("!confirm-delete-claw alice-claw");
+    expect(bridge.looksLikeAdminCommand("!show clawz")).toBe(true);
+    expect(bridge.looksLikeAdminCommand("hello")).toBe(false);
+  });
+
+  it("builds actionable auth recovery guidance for per-user Claude OAuth", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-auth-"));
+    const credentialsDir = path.join(tempRoot, "credentials");
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    fs.writeFileSync(path.join(credentialsDir, "claude-credentials.json"), JSON.stringify({
+      claudeAiOauth: { accessToken: "sk-ant-oat01-test" },
+    }));
+
+    const text = bridge.buildAuthRecoveryMessage({ credentialsDir });
+    expect(text).toContain("per-user Claude OAuth credentials");
+    expect(text).toContain("!setup claude <fresh ~/.claude/.credentials.json>");
+  });
+
+  it("prefers a long-lived Claude token as the auth source", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-token-"));
+    const credentialsDir = path.join(tempRoot, "credentials");
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    fs.writeFileSync(path.join(credentialsDir, "claude-oauth-token.txt"), "sk-ant-oat01-token");
+
+    expect(bridge.describeClaudeCredentialSource({ credentialsDir })).toBe("per-user long-lived token");
+    expect(bridge.buildAuthRecoveryMessage({ credentialsDir })).toContain("!setup claude-token <token>");
+  });
+
+  it("reports Claude auth as not configured when no per-user credentials exist", () => {
+    expect(bridge.describeClaudeCredentialSource({
+      credentialsDir: path.join(os.tmpdir(), "missing-per-user-claude-creds"),
+    })).toBe("not configured");
+  });
+
+  it("builds a fallback agent command that skips Claude auth and exposes OpenAI routing env", () => {
+    const cmd = bridge.buildAgentCommand("hello", "abc", {
+      slackUserId: "U1",
+      slackDisplayName: "Alice",
+      roles: ["user"],
+    }, {
+      skipClaudeAuth: true,
+    });
+    expect(cmd).toContain("unset ANTHROPIC_API_KEY");
+    expect(cmd).toContain("NEMOCLAW_SKIP_CLAUDE_AUTH=1");
+    expect(cmd).toContain("export OPENAI_API_KEY=");
+    expect(cmd).not.toContain("PYMODEL");
   });
 
   it("builds admin users from roles and allowlist-only entries", () => {

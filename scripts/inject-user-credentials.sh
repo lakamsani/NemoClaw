@@ -20,10 +20,6 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
-SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
-SHARED_CLAUDE_SETTINGS="${NEMOCLAW_SHARED_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
-SHARED_CLAUDE_MCP_CACHE="${NEMOCLAW_SHARED_CLAUDE_MCP_CACHE:-$HOME/.claude/mcp-needs-auth-cache.json}"
-
 SANDBOX="${1:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir> [--github-user <user>]}"
 CRED_DIR="${2:?Usage: inject-user-credentials.sh <sandbox-name> <cred-dir>}"
 shift 2
@@ -67,34 +63,53 @@ ssh_cmd() {
   ssh -F "$SSH_CONF" -o StrictHostKeyChecking=no "openshell-${SANDBOX}" "$@"
 }
 
+patch_claude_runtime() {
+  local anthropic_key="${1:-}"
+  ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path):
+    raise SystemExit(0)
+cfg = json.load(open(path))
+providers = cfg.setdefault('models', {}).setdefault('providers', {})
+anthropic = providers.get('anthropic')
+if isinstance(anthropic, dict) and '${anthropic_key}':
+    anthropic['apiKey'] = '${anthropic_key}'
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+}
+
 # Ensure target directories exist
 ssh_cmd 'mkdir -p /sandbox/.claude /sandbox/.config/gh'
 
-# ── Anthropic API key (per-user, for Anthropic models + Claude Code) ──
-if [ -f "$CRED_DIR/anthropic-key.txt" ]; then
-  ANTHROPIC_KEY="$(cat "$CRED_DIR/anthropic-key.txt")"
-  ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${ANTHROPIC_KEY}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${ANTHROPIC_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env"
-  info "Anthropic API key injected (per-user)"
+# ── Claude long-lived Teams token (preferred when present) ──────
+if [ -f "$CRED_DIR/claude-oauth-token.txt" ]; then
+  CLAUDE_OAUTH_TOKEN="$(cat "$CRED_DIR/claude-oauth-token.txt")"
+  ssh_cmd "grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_OAUTH_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${CLAUDE_OAUTH_TOKEN}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${CLAUDE_OAUTH_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  patch_claude_runtime "$CLAUDE_OAUTH_TOKEN"
+  info "Claude long-lived token injected (per-user)"
 fi
 
 # ── Claude Code credentials ──────────────────────────────────────
 if [ -f "$CRED_DIR/claude-credentials.json" ]; then
   base64 "$CRED_DIR/claude-credentials.json" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
+  CLAUDE_ACCESS_TOKEN="$(python3 -c "import json; d=json.load(open('$CRED_DIR/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
+  if [ -n "$CLAUDE_ACCESS_TOKEN" ]; then
+    ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${CLAUDE_ACCESS_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env"
+  fi
+  patch_claude_runtime "$CLAUDE_ACCESS_TOKEN"
   info "Claude credentials injected (per-user)"
-elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
-  base64 "$SHARED_CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-  info "Claude credentials injected (shared org fallback)"
-else
-  warn "No Claude credentials found"
+elif [ ! -f "$CRED_DIR/claude-oauth-token.txt" ]; then
+  warn "No per-user Claude credentials found"
 fi
 
 # Claude settings
 if [ -f "$CRED_DIR/claude-settings.json" ]; then
   base64 "$CRED_DIR/claude-settings.json" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
   info "Claude settings injected (per-user)"
-elif [ -f "$SHARED_CLAUDE_SETTINGS" ]; then
-  base64 "$SHARED_CLAUDE_SETTINGS" | ssh_cmd 'base64 -d > /sandbox/.claude/settings.json'
-  info "Claude settings injected (shared org fallback)"
 fi
 
 # ── Freshrelease MCP server (per-user API key) ───────────────────
@@ -107,7 +122,8 @@ if [ -f "$CRED_DIR/freshrelease-api-key.txt" ]; then
 import json, os
 path = '/sandbox/.claude/settings.json'
 if not os.path.exists(path):
-    exit(0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump({}, open(path, 'w'), indent=4)
 cfg = json.load(open(path))
 mcp = cfg.setdefault('mcpServers', {})
 mcp['freshrelease'] = {
@@ -142,9 +158,6 @@ fi
 if [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
   base64 "$CRED_DIR/mcp-needs-auth-cache.json" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
   info "Claude MCP auth cache injected (per-user)"
-elif [ -f "$SHARED_CLAUDE_MCP_CACHE" ]; then
-  base64 "$SHARED_CLAUDE_MCP_CACHE" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
-  info "Claude MCP auth cache injected (shared org fallback)"
 fi
 
 # ── GitHub token (per-user only — no host fallback) ──────────────

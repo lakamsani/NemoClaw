@@ -129,6 +129,10 @@ function setupClaude(user, jsonStr) {
   const accessToken = (parsed.claudeAiOauth || {}).accessToken || "";
   if (accessToken) {
     try {
+      sshCmd(user.sandboxName,
+        `grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${accessToken}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${accessToken}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
+    } catch {}
+    try {
       const patchScript = `
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -137,15 +141,58 @@ if os.path.exists(path):
     p = cfg.get('models',{}).get('providers',{}).get('anthropic',{})
     if p:
         p['apiKey'] = '${accessToken}'
-        json.dump(cfg, open(path, 'w'), indent=2)
-        os.chmod(path, 0o600)
+    cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+    json.dump(cfg, open(path, 'w'), indent=2)
+    os.chmod(path, 0o600)
 `;
       const scriptB64 = Buffer.from(patchScript).toString("base64");
       sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
     } catch {}
   }
 
-  return `Claude credentials saved and injected into sandbox \`${user.sandboxName}\`.`;
+  return `Claude credentials saved and injected into sandbox \`${user.sandboxName}\`.\n` +
+    "Anthropic runtime config was updated from the new Claude OAuth access token and reset to the Claude primary model.";
+}
+
+function setupClaudeToken(user, token) {
+  token = token.trim();
+  token = token.replace(/^```\s*/m, "").replace(/\s*```$/m, "").trim();
+
+  if (!token.startsWith("sk-ant-oat")) {
+    return "Invalid Claude token. Expected the long-lived token produced by `claude setup-token`.\n" +
+      "It should start with `sk-ant-oat`.";
+  }
+
+  const credDir = resolvePath(user.credentialsDir);
+  fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(credDir, "claude-oauth-token.txt"), token, { mode: 0o600 });
+
+  try {
+    sshCmd(user.sandboxName,
+      `grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${token}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${token}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
+    sshCmd(user.sandboxName,
+      `grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${token}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${token}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
+  } catch {}
+
+  try {
+    const patchScript = `
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if os.path.exists(path):
+    cfg = json.load(open(path))
+    p = cfg.get('models',{}).get('providers',{}).get('anthropic',{})
+    if p:
+        p['apiKey'] = '${token}'
+    cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+    json.dump(cfg, open(path, 'w'), indent=2)
+    os.chmod(path, 0o600)
+`;
+    const scriptB64 = Buffer.from(patchScript).toString("base64");
+    sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
+  } catch {}
+
+  return `Claude long-lived token saved and injected into sandbox \`${user.sandboxName}\`.\n` +
+    "This token came from `claude setup-token`, is now the preferred per-user Claude auth source, and reset the sandbox back to the Claude primary model.";
 }
 
 function setupGoogle(user, b64Data) {
@@ -270,57 +317,6 @@ function setupUser(user, content) {
   return `User context (USER.md) updated in sandbox \`${user.sandboxName}\`.`;
 }
 
-function setupAnthropicKey(user, key) {
-  key = key.trim();
-  // Accept code blocks
-  key = key.replace(/^```\s*/m, "").replace(/\s*```$/m, "").trim();
-
-  if (!key.startsWith("sk-ant-")) {
-    return "Invalid Anthropic API key. Expected a key starting with `sk-ant-`.\n" +
-      "Get one at: https://console.anthropic.com/settings/keys";
-  }
-
-  // Persist to credentials dir
-  const credDir = resolvePath(user.credentialsDir);
-  fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(credDir, "anthropic-key.txt"), key, { mode: 0o600 });
-
-  // Inject into sandbox .env
-  sshCmd(user.sandboxName,
-    `grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${key}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${key}' >> /sandbox/.env; chmod 600 /sandbox/.env`);
-
-  // Patch openclaw.json anthropic provider with the key
-  try {
-    const patchScript = `
-import json, os
-path = os.path.expanduser('~/.openclaw/openclaw.json')
-if os.path.exists(path):
-    cfg = json.load(open(path))
-    providers = cfg.get('models',{}).get('providers',{})
-    if 'anthropic' not in providers:
-        providers['anthropic'] = {'baseUrl': 'https://api.anthropic.com/v1', 'api': 'anthropic-messages', 'models': [{'id': 'claude-sonnet-4-6', 'name': 'Claude Sonnet 4.6', 'reasoning': False, 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}, 'contextWindow': 200000, 'maxTokens': 64000}]}
-        cfg.setdefault('models', {}).setdefault('providers', {})['anthropic'] = providers['anthropic']
-    providers['anthropic']['apiKey'] = '${key}'
-    cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
-    json.dump(cfg, open(path, 'w'), indent=2)
-    os.chmod(path, 0o600)
-
-    # Write auth profiles for coding agent
-    apath = os.path.expanduser('~/.openclaw/agents/main/agent/auth-profiles.json')
-    os.makedirs(os.path.dirname(apath), exist_ok=True)
-    profiles = {}
-    profiles['anthropic:manual'] = {'type': 'api_key', 'provider': 'anthropic', 'keyRef': {'source': 'env', 'id': 'ANTHROPIC_API_KEY'}, 'profileId': 'anthropic:manual'}
-    json.dump(profiles, open(apath, 'w'))
-    os.chmod(apath, 0o600)
-`;
-    const scriptB64 = Buffer.from(patchScript).toString("base64");
-    sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
-  } catch {}
-
-  return `Anthropic API key saved and injected into sandbox \`${user.sandboxName}\`.\n` +
-    "Your agent will use this key for Anthropic models and Claude Code.";
-}
-
 function setupFreshrelease(user, key) {
   key = key.trim();
   // Accept code blocks
@@ -343,12 +339,13 @@ function setupFreshrelease(user, key) {
 import json, os, sys
 path = '/sandbox/.claude/settings.json'
 if not os.path.exists(path):
-    sys.exit(0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump({}, open(path, 'w'), indent=4)
 cfg = json.load(open(path))
 mcp = cfg.setdefault('mcpServers', {})
 mcp['freshrelease'] = {
-    'command': '/root/.local/bin/uvx',
-    'args': ['freshrelease-mcp'],
+    'command': '/usr/local/bin/freshrelease-mcp',
+    'args': [],
     'env': {
         'FRESHRELEASE_DOMAIN': 'freshworks.freshrelease.com',
         'FRESHRELEASE_API_KEY': '${key}'
@@ -361,7 +358,8 @@ os.chmod(path, 0o600)
   sshPipe(user.sandboxName, scriptB64 + "\n",
     "base64 -d | python3");
 
-  return `Freshrelease API key saved and MCP server configured in sandbox \`${user.sandboxName}\`.`;
+  return `Freshrelease API key saved and MCP server configured in sandbox \`${user.sandboxName}\`.\n` +
+    "This does not configure Claude auth. Use `!setup claude` separately.";
 }
 
 function setupWebhook(user, url) {
@@ -414,7 +412,7 @@ function setupStatus(user) {
 
   const checks = {
     "Claude credentials": fs.existsSync(path.join(credDir, "claude-credentials.json")),
-    "Anthropic API key": fs.existsSync(path.join(credDir, "anthropic-key.txt")),
+    "Claude Teams token": fs.existsSync(path.join(credDir, "claude-oauth-token.txt")),
     "GitHub token": fs.existsSync(path.join(credDir, "gh-hosts.yml")),
     "Google OAuth (gogcli)": fs.existsSync(path.join(credDir, "gogcli", "config.json")),
     "Freshrelease API key": fs.existsSync(path.join(credDir, "freshrelease-api-key.txt")),
@@ -460,10 +458,10 @@ function setupHelp() {
 
 *Credentials* (send via DM only — your message will be deleted after processing):
 • \`!setup github <token>\` — GitHub personal access token (ghp_...)
+• \`!setup claude-token <token>\` — Recommended for Claude Teams users, especially on macOS. Run \`claude setup-token\` on your machine and paste the long-lived token
 • \`!setup freshrelease <key>\` — Freshrelease API key for ticket management MCP
 • \`!setup webhook <url>\` — Slack incoming webhook URL (optional override)
-• \`!setup anthropic-key <key>\` — Anthropic API key (sk-ant-...) for Claude models + coding agent
-• \`!setup claude <json>\` — Paste contents of \`~/.claude/.credentials.json\`
+• \`!setup claude <json>\` — Secondary option for users whose Claude Code install stores OAuth JSON on disk. In practice this is mainly Linux users with \`~/.claude/.credentials.json\`
 • \`!setup google <base64>\` — Google OAuth credentials
   _Run on your machine:_ \`cd ~/.config/gogcli && tar czf - . | base64\`
 
@@ -481,12 +479,16 @@ function setupHelp() {
 Heartbeat notifications (email/calendar alerts) are sent as DMs from this bot by default — no setup needed.
 Use \`!setup webhook\` only if you want notifications posted to a specific channel instead.
 
+*Claude Teams Note:*
+Most MacBook users should use \`!setup claude-token <token>\` after running \`claude setup-token\`.
+Use \`!setup claude <json>\` only if your machine actually has \`~/.claude/.credentials.json\` available, which is more common on Linux.
+
 _All credential messages are deleted immediately after processing for security._`;
 }
 
 // ── Main dispatch ───────────────────────────────────────────────
 
-const CREDENTIAL_COMMANDS = new Set(["github", "claude", "google", "webhook", "anthropic-key", "freshrelease"]);
+const CREDENTIAL_COMMANDS = new Set(["github", "claude", "claude-token", "google", "webhook", "freshrelease"]);
 
 /**
  * Handle a !setup command.
@@ -512,12 +514,12 @@ function handleSetup(user, text) {
         response = setupClaude(user, arg);
         deleteMessage = true;
         break;
-      case "google":
-        response = setupGoogle(user, arg);
+      case "claude-token":
+        response = setupClaudeToken(user, arg);
         deleteMessage = true;
         break;
-      case "anthropic-key":
-        response = setupAnthropicKey(user, arg);
+      case "google":
+        response = setupGoogle(user, arg);
         deleteMessage = true;
         break;
       case "webhook":

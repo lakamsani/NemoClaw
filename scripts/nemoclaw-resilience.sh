@@ -23,8 +23,6 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
-SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
-
 SANDBOX="${NEMOCLAW_SANDBOX:-veyonce-claw}"
 CRED_DIR=""
 GITHUB_USER=""
@@ -136,34 +134,22 @@ if [ -n "$CRED_DIR" ]; then
   "$SCRIPT_DIR/inject-user-credentials.sh" "$SANDBOX" "$CRED_DIR" $GITHUB_FLAG $SLACK_FLAG
   info "Per-user credentials injected via inject-user-credentials.sh"
 
-  # Extract ANTHROPIC_API_KEY for openclaw config
-  # Prefer long-lived setup-token (env var) over expiring OAuth access token
+  # Extract ANTHROPIC_API_KEY for openclaw config from per-user credentials
   if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     if [ -n "$CRED_DIR" ] && [[ "$CRED_DIR" == /* ]]; then
       CRED_ABS="$CRED_DIR"
     else
       CRED_ABS="$REPO_DIR/$CRED_DIR"
     fi
-    if [ -f "$CRED_ABS/claude-credentials.json" ]; then
+    if [ -f "$CRED_ABS/claude-oauth-token.txt" ]; then
+      ANTHROPIC_API_KEY="$(cat "$CRED_ABS/claude-oauth-token.txt")"
+    elif [ -f "$CRED_ABS/claude-credentials.json" ]; then
       ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$CRED_ABS/claude-credentials.json')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-    elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
-      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$SHARED_CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
     fi
   fi
 else
-  # Legacy single-user mode: inject from host defaults
-  # Claude credentials (base64 over SSH — sftp is broken in sandbox)
-  if [ -f "$SHARED_CLAUDE_CREDS" ]; then
-    ssh_cmd 'mkdir -p /sandbox/.claude'
-    base64 "$SHARED_CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-    info "Claude credentials injected (shared org fallback)"
-
-    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-      ANTHROPIC_API_KEY="$(python3 -c "import json; d=json.load(open('$SHARED_CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-    fi
-  else
-    warn "No shared Claude credentials available"
-  fi
+  # Legacy single-user mode is no longer configured for shared Claude OAuth.
+  warn "No per-user credential directory provided. Shared Claude fallback is disabled."
 
   # Claude MCP auth cache
   if [ -f "$HOME/.claude/mcp-needs-auth-cache.json" ]; then
@@ -402,6 +388,18 @@ if [ -n "$LATEST_CC" ] && [ "$CURRENT_CC" != "$LATEST_CC" ]; then
   info "Claude Code upgraded: ${CURRENT_CC:-unknown} → ${LATEST_CC}"
 else
   info "Claude Code already at latest (${CURRENT_CC:-unknown})"
+fi
+
+# ── Step 6c: Install freshrelease-mcp from bundled wheels ─────
+WHEELS_TAR="$REPO_DIR/persist/packages/freshrelease-mcp-wheels.tar.gz"
+if [ -f "$WHEELS_TAR" ]; then
+  CURRENT_FR="$(ssh_cmd 'freshrelease-mcp --version 2>/dev/null || true' 2>/dev/null)"
+  if [ -z "$CURRENT_FR" ]; then
+    cat "$WHEELS_TAR" | ssh_cmd 'cat > /tmp/wheels.tar.gz && mkdir -p /tmp/wheels && tar xzf /tmp/wheels.tar.gz -C /tmp/wheels && pip3 install --break-system-packages --no-deps --no-index --find-links /tmp/wheels freshrelease-mcp 2>&1 | tail -1 && rm -rf /tmp/wheels /tmp/wheels.tar.gz'
+    info "freshrelease-mcp installed from bundled wheels"
+  else
+    info "freshrelease-mcp already installed ($CURRENT_FR)"
+  fi
 fi
 
 # ── Step 7: Restore cron jobs ──────────────────────────────────

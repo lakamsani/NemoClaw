@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Lightweight credential refresh — proactively refreshes the shared Claude OAuth
-# token (if expiring soon) and re-injects the selected Claude auth into the
-# sandbox's openclaw.json.
+# Lightweight credential refresh for per-user auth state.
+# Re-injects per-user Claude OAuth or per-user Anthropic API keys into the
+# sandbox and keeps runtime config aligned.
 # Run on a cron every 30 minutes.
 #
 # Usage: ./scripts/refresh-credentials.sh [sandbox-name]
@@ -51,61 +51,6 @@ if [ -n "$CRED_DIR" ]; then
   USER_ENV_FILE="$(dirname "$CRED_DIR")/.env"
 fi
 
-# ── Proactive OAuth token refresh ─────────────────────────────────
-# Check if the host's Claude OAuth access token expires within 90 minutes.
-# If so, run a lightweight `claude -p` command which triggers Claude Code's
-# built-in token refresh for the shared org credential source.
-REFRESH_THRESHOLD_MS=5400000  # 90 minutes in milliseconds
-SHARED_CLAUDE_CREDS="${NEMOCLAW_SHARED_CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
-SHARED_CLAUDE_MCP_CACHE="${NEMOCLAW_SHARED_CLAUDE_MCP_CACHE:-$HOME/.claude/mcp-needs-auth-cache.json}"
-
-# Only skip OAuth refresh if ANTHROPIC_API_KEY is a real long-lived API key
-# (sk-ant-api...). OAuth access tokens (sk-ant-oat...) expire and need refresh.
-# Any other format (e.g. stale/invalid keys) should not block OAuth refresh.
-IS_LONG_LIVED_KEY=false
-if [ -n "${ANTHROPIC_API_KEY:-}" ] && [[ "${ANTHROPIC_API_KEY}" == sk-ant-api* ]]; then
-  IS_LONG_LIVED_KEY=true
-fi
-
-if [ "$IS_LONG_LIVED_KEY" = "false" ] && [ -f "$SHARED_CLAUDE_CREDS" ]; then
-  NEEDS_REFRESH=$(python3 -c "
-import json, time, sys
-try:
-    d = json.load(open('$SHARED_CLAUDE_CREDS'))
-    exp = d.get('claudeAiOauth', {}).get('expiresAt', 0)
-    now = time.time() * 1000
-    remaining = exp - now
-    if remaining < $REFRESH_THRESHOLD_MS:
-        print('yes')
-        sys.exit(0)
-except Exception:
-    pass
-print('no')
-" 2>/dev/null || echo "no")
-
-  if [ "$NEEDS_REFRESH" = "yes" ]; then
-    echo "[refresh] OAuth token expiring soon, triggering refresh via claude CLI... ($(date))"
-    # Run a minimal claude command to trigger the built-in OAuth refresh.
-    # NOTE: Do NOT use --bare — it skips OAuth and fails with "Not logged in".
-    # Use < /dev/null to avoid stdin warning. Retry up to 3 times.
-    REFRESH_OK=false
-    for attempt in 1 2 3; do
-    if timeout 45 claude -p "ok" --max-turns 1 --output-format text < /dev/null > /dev/null 2>&1; then
-        REFRESH_OK=true
-        echo "[refresh] OAuth token refreshed successfully on attempt $attempt ($(date))"
-        break
-      else
-        echo "[refresh] OAuth refresh attempt $attempt failed ($(date))"
-        sleep 3
-      fi
-    done
-
-    if [ "$REFRESH_OK" != "true" ]; then
-      echo "[refresh] ERROR: OAuth token refresh failed after 3 attempts — token may expire soon ($(date))"
-    fi
-  fi
-fi
-
 # Refresh SSH config
 openshell sandbox ssh-config "$SANDBOX" > "$SSH_CONF" 2>/dev/null || exit 0
 
@@ -146,25 +91,23 @@ for (const pid of dirs) {
 # Check sandbox is reachable
 ssh_cmd 'true' 2>/dev/null || exit 0
 
-# Re-inject Claude credentials (per-user dir first, then host default)
+# Re-inject per-user Claude credentials
 CLAUDE_CREDS=""
+CLAUDE_OAUTH_TOKEN_FILE=""
 DESIRED_ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
+DESIRED_CLAUDE_CODE_TOKEN=""
+if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-oauth-token.txt" ]; then
+  CLAUDE_OAUTH_TOKEN_FILE="$CRED_DIR/claude-oauth-token.txt"
+  DESIRED_CLAUDE_CODE_TOKEN="$(cat "$CLAUDE_OAUTH_TOKEN_FILE")"
+  DESIRED_ANTHROPIC_KEY="$DESIRED_CLAUDE_CODE_TOKEN"
+fi
 if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/claude-credentials.json" ]; then
   CLAUDE_CREDS="$CRED_DIR/claude-credentials.json"
-elif [ -f "$SHARED_CLAUDE_CREDS" ]; then
-  CLAUDE_CREDS="$SHARED_CLAUDE_CREDS"
 fi
 
 if [ -n "$CLAUDE_CREDS" ]; then
   base64 "$CLAUDE_CREDS" | ssh_cmd 'base64 -d > /sandbox/.claude/.credentials.json && chmod 600 /sandbox/.claude/.credentials.json'
-
-  # Use long-lived API key if available; otherwise extract fresh OAuth access token
-  if [ "$IS_LONG_LIVED_KEY" = "true" ]; then
-    : # Already set from environment (long-lived API key, not an OAuth token)
-  else
-    # Always read fresh access token from credentials file (may have been refreshed above)
-    DESIRED_ANTHROPIC_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
-  fi
+  DESIRED_ANTHROPIC_KEY="$(python3 -c "import json; d=json.load(open('$CLAUDE_CREDS')); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null || true)"
 fi
 
 # Re-inject Anthropic API key if stored separately (per-user)
@@ -177,6 +120,7 @@ fi
 
 GATEWAY_TOKEN="${GATEWAY_AUTH_TOKEN:?GATEWAY_AUTH_TOKEN must be set}"
 CURRENT_ANTHROPIC_KEY="$(ssh_cmd "grep '^ANTHROPIC_API_KEY=' /sandbox/.env 2>/dev/null | tail -1 | cut -d= -f2-" 2>/dev/null || true)"
+CURRENT_CLAUDE_CODE_TOKEN="$(ssh_cmd "grep '^CLAUDE_CODE_OAUTH_TOKEN=' /sandbox/.env 2>/dev/null | tail -1 | cut -d= -f2-" 2>/dev/null || true)"
 CURRENT_GATEWAY_TOKEN="$(ssh_cmd "python3 -c \"
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -196,13 +140,39 @@ cfg = json.load(open(path))
 p = cfg.get('models',{}).get('providers',{}).get('anthropic',{})
 if p:
     p['apiKey'] = '${DESIRED_ANTHROPIC_KEY}'
-    json.dump(cfg, open(path, 'w'), indent=2)
-    os.chmod(path, 0o600)
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
 \"" 2>/dev/null
 
   # OpenClaw reads env vars with higher priority than models.json, so keep both in sync.
   ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${DESIRED_ANTHROPIC_KEY}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${DESIRED_ANTHROPIC_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
   GATEWAY_RESTART_NEEDED=true
+fi
+
+CURRENT_PRIMARY_MODEL="$(ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+try:
+    cfg = json.load(open(path))
+    print(((cfg.get('agents') or {}).get('defaults') or {}).get('model', {}).get('primary', ''))
+except Exception:
+    print('')
+\"" 2>/dev/null || true)"
+if [ -n "$DESIRED_ANTHROPIC_KEY" ] && [ "$CURRENT_PRIMARY_MODEL" != "anthropic/claude-sonnet-4-6" ]; then
+  ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(path))
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+  GATEWAY_RESTART_NEEDED=true
+fi
+
+if [ -n "$DESIRED_CLAUDE_CODE_TOKEN" ] && [ "$CURRENT_CLAUDE_CODE_TOKEN" != "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
+  ssh_cmd "grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${DESIRED_CLAUDE_CODE_TOKEN}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${DESIRED_CLAUDE_CODE_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
 fi
 
 if [ "$CURRENT_GATEWAY_TOKEN" != "$GATEWAY_TOKEN" ]; then
@@ -250,8 +220,8 @@ fi
 if [ -n "$CLAUDE_CREDS" ]; then
   echo "[refresh] Claude credentials synced for $SANDBOX from $CLAUDE_CREDS ($(date))"
 fi
-if [ -n "$ANTHROPIC_KEY_FILE" ]; then
-  echo "[refresh] Anthropic API key enforced from per-user credentials for $SANDBOX ($(date))"
+if [ -n "$CLAUDE_OAUTH_TOKEN_FILE" ]; then
+  echo "[refresh] Claude long-lived token enforced from per-user credentials for $SANDBOX ($(date))"
 fi
 
 # Re-inject GOG_KEYRING_PASSWORD (strictly per-user)
@@ -288,12 +258,10 @@ if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/slack-webhook-url.txt" ]; then
   ssh_cmd "grep -q SLACK_WEBHOOK_URL /sandbox/.env 2>/dev/null && sed -i 's|^SLACK_WEBHOOK_URL=.*|SLACK_WEBHOOK_URL=${USER_SLACK_WEBHOOK}|' /sandbox/.env || echo 'SLACK_WEBHOOK_URL=${USER_SLACK_WEBHOOK}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
 fi
 
-# Re-inject MCP auth cache (per-user dir first, then host default)
+# Re-inject per-user MCP auth cache
 MCP_CACHE=""
 if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/mcp-needs-auth-cache.json" ]; then
   MCP_CACHE="$CRED_DIR/mcp-needs-auth-cache.json"
-elif [ -f "$SHARED_CLAUDE_MCP_CACHE" ]; then
-  MCP_CACHE="$SHARED_CLAUDE_MCP_CACHE"
 fi
 if [ -n "$MCP_CACHE" ]; then
   base64 "$MCP_CACHE" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'

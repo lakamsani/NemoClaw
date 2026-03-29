@@ -25,6 +25,7 @@ const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
 const userRegistry = require("../bin/lib/user-registry");
 const sandboxRegistry = require("../bin/lib/registry");
 const { isSetupCommand, handleSetup, setupHelp, normalizeText } = require("../bin/lib/credential-setup");
+const { getProviderSelectionConfig } = require("../bin/lib/inference-config");
 
 const OPENSHELL = resolveOpenshell();
 
@@ -53,12 +54,6 @@ function sh(value) {
 const DELETE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const MAX_DISPLAY_NAME_LENGTH = 80;
 const MAX_GITHUB_HANDLE_LENGTH = 39;
-const SHARED_CLAUDE_CREDENTIALS = process.env.NEMOCLAW_SHARED_CLAUDE_CREDENTIALS
-  || path.join(process.env.HOME || "/tmp", ".claude", ".credentials.json");
-const SHARED_CLAUDE_SETTINGS = process.env.NEMOCLAW_SHARED_CLAUDE_SETTINGS
-  || path.join(process.env.HOME || "/tmp", ".claude", "settings.json");
-const SHARED_CLAUDE_MCP_CACHE = process.env.NEMOCLAW_SHARED_CLAUDE_MCP_CACHE
-  || path.join(process.env.HOME || "/tmp", ".claude", "mcp-needs-auth-cache.json");
 
 function withAdminState(user) {
   if (!user) return null;
@@ -77,28 +72,45 @@ function isAdminUser(user) {
   return !!(user && Array.isArray(user.roles) && user.roles.includes("admin"));
 }
 
+function canonicalizeAdminCommand(text) {
+  return normalizeText(text)
+    .replace(/^!show\s+claws\b/i, "!show-claws")
+    .replace(/^!list\s+claws\b/i, "!list-claws")
+    .replace(/^!show\s+user\b/i, "!show-user")
+    .replace(/^!admin\s+audit\b/i, "!admin-audit")
+    .replace(/^!admin\s+help\b/i, "!admin-help")
+    .replace(/^!help\s+admin\b/i, "!help-admin")
+    .replace(/^!add\s+claw\b/i, "!add-claw")
+    .replace(/^!delete\s+claw\b/i, "!delete-claw")
+    .replace(/^!confirm(?:-|\s+)delete(?:-|\s+)claw\b/i, "!confirm-delete-claw");
+}
+
+function looksLikeAdminCommand(text) {
+  return /^!(show|list|admin|help|add|delete|confirm)\b/i.test(canonicalizeAdminCommand(text).trim());
+}
+
 function isListAdminsCommand(text) {
-  const normalized = normalizeText(text).toLowerCase();
+  const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized === "!admins" || normalized === "!admins list" || normalized === "!admin-users";
 }
 
 function isAdminAuditCommand(text) {
-  const normalized = normalizeText(text).toLowerCase();
+  const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized === "!admin-audit" || normalized === "!admin-audit 10" || normalized === "!admin-log";
 }
 
 function isShowClawsCommand(text) {
-  const normalized = normalizeText(text).toLowerCase();
+  const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized.startsWith("!show-claws") || normalized === "!claws" || normalized.startsWith("!list-claws");
 }
 
 function isShowUserCommand(text) {
-  const normalized = normalizeText(text).toLowerCase();
+  const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized.startsWith("!show-user");
 }
 
 function isAdminHelpCommand(text) {
-  const normalized = normalizeText(text).toLowerCase();
+  const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized === "!admin-help" || normalized === "!help-admin";
 }
 
@@ -150,15 +162,15 @@ function getProvisioningSummary(slackId, clawName) {
 }
 
 function isAddClawCommand(text) {
-  return normalizeText(text).toLowerCase().startsWith("!add-claw");
+  return canonicalizeAdminCommand(text).toLowerCase().startsWith("!add-claw");
 }
 
 function isDeleteClawCommand(text) {
-  return normalizeText(text).toLowerCase().startsWith("!delete-claw");
+  return canonicalizeAdminCommand(text).toLowerCase().startsWith("!delete-claw");
 }
 
 function isConfirmDeleteClawCommand(text) {
-  return normalizeText(text).toLowerCase().startsWith("!confirm-delete-claw");
+  return canonicalizeAdminCommand(text).toLowerCase().startsWith("!confirm-delete-claw");
 }
 
 function listAdminUsers() {
@@ -315,28 +327,48 @@ function getClaudeCredentialSource(user) {
   const credDir = path.isAbsolute(user.credentialsDir)
     ? user.credentialsDir
     : path.join(REPO_DIR, user.credentialsDir);
+  const tokenPath = path.join(credDir, "claude-oauth-token.txt");
+  if (fs.existsSync(tokenPath)) {
+    return { mode: "long-lived-token", path: tokenPath };
+  }
   const perUserPath = path.join(credDir, "claude-credentials.json");
   if (fs.existsSync(perUserPath)) {
     return { mode: "per-user", path: perUserPath };
-  }
-  if (fs.existsSync(SHARED_CLAUDE_CREDENTIALS)) {
-    return { mode: "shared-org", path: SHARED_CLAUDE_CREDENTIALS };
   }
   return { mode: "missing", path: "" };
 }
 
 function describeClaudeCredentialSource(user) {
   const source = getClaudeCredentialSource(user);
+  if (source.mode === "long-lived-token") return "per-user long-lived token";
   if (source.mode === "per-user") return "per-user";
-  if (source.mode === "shared-org") return `shared org fallback (\`${source.path}\`)`;
   return "not configured";
 }
 
-function describeClaudeSupportFiles() {
-  const details = [];
-  if (fs.existsSync(SHARED_CLAUDE_SETTINGS)) details.push(`settings: \`${SHARED_CLAUDE_SETTINGS}\``);
-  if (fs.existsSync(SHARED_CLAUDE_MCP_CACHE)) details.push(`mcp cache: \`${SHARED_CLAUDE_MCP_CACHE}\``);
-  return details.length ? details.join(", ") : "none";
+function buildAuthRecoveryMessage(user) {
+  const source = getClaudeCredentialSource(user);
+  if (source.mode === "per-user") {
+    return [
+      "Anthropic authentication is still failing after retry.",
+      "Your sandbox is using per-user Claude OAuth credentials, and those tokens cannot be auto-refreshed by the bridge.",
+      "Run `!setup claude <fresh ~/.claude/.credentials.json>` with a newly refreshed Claude login.",
+    ].join("\n");
+  }
+  if (source.mode === "long-lived-token") {
+    return [
+      "Anthropic authentication is still failing after retry.",
+      "Your sandbox is using a per-user Claude long-lived token from `claude setup-token`.",
+      "Re-run `claude setup-token` on your machine and DM the new token with `!setup claude-token <token>`.",
+    ].join("\n");
+  }
+  return [
+    "Anthropic authentication is not configured for this sandbox.",
+    "Run `!setup claude-token <token>` from `claude setup-token`, or `!setup claude <fresh ~/.claude/.credentials.json>`.",
+  ].join("\n");
+}
+
+function requestLikelyNeedsMcp(text) {
+  return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b/i.test(String(text || ""));
 }
 
 function listConfiguredCredentials(user) {
@@ -346,8 +378,8 @@ function listConfiguredCredentials(user) {
     : path.join(REPO_DIR, user.credentialsDir);
   const configured = [];
   const checks = [
+    ["Claude Teams token", path.join(credDir, "claude-oauth-token.txt")],
     ["Claude OAuth", path.join(credDir, "claude-credentials.json")],
-    ["Anthropic API key", path.join(credDir, "anthropic-key.txt")],
     ["GitHub", path.join(credDir, "gh-hosts.yml")],
     ["Google (gogcli)", path.join(credDir, "gogcli", "config.json")],
     ["Freshrelease", path.join(credDir, "freshrelease-api-key.txt")],
@@ -393,7 +425,7 @@ function buildClawInventory() {
 }
 
 function parseShowClawsOptions(text) {
-  const args = parseCommandArgs(text).slice(1);
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   const options = {
     filters: [],
     sort: "name",
@@ -658,14 +690,13 @@ function buildShowUserText(user) {
     `Status: ${liveSandbox?.phase || "Not Found"}`,
     `Up For: ${formatDurationFrom(liveSandbox?.createdAt || registrySandbox?.createdAt || user.createdAt)}`,
     `Claude Auth: ${describeClaudeCredentialSource(user)}`,
-    `Shared Claude Support: ${describeClaudeSupportFiles()}`,
     `Credentials: ${credentials.length ? credentials.join(", ") : "none"}`,
     `Policies: ${policies.length ? policies.join(", ") : "none"}`,
   ].join("\n");
 }
 
 function buildShowUserPayload(text) {
-  const args = parseCommandArgs(text).slice(1);
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   return { text: buildShowUserText(resolveUserLookup(args.join(" "))) };
 }
 
@@ -674,7 +705,7 @@ function formatAddClawUsage() {
 }
 
 async function handleAddClaw(user, text) {
-  const args = parseCommandArgs(text).slice(1);
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   if (args.length < 4) {
     return { ok: false, message: formatAddClawUsage() };
   }
@@ -763,7 +794,7 @@ async function handleAddClaw(user, text) {
 }
 
 async function handleDeleteClaw(user, text) {
-  const args = parseCommandArgs(text).slice(1);
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   if (args.length !== 1) {
     return {
       ok: false,
@@ -799,7 +830,7 @@ async function handleDeleteClaw(user, text) {
 }
 
 async function handleConfirmDeleteClaw(user, text) {
-  const args = parseCommandArgs(text).slice(1);
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
   if (args.length !== 1) {
     return {
       ok: false,
@@ -871,9 +902,152 @@ function refreshCredentials(sandboxName, credDir = "") {
   }
 }
 
+function getRuntimeFallbackModels(sandboxName) {
+  try {
+    const sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
+    const confPath = `/tmp/nemoclaw-fallback-${sandboxName}.conf`;
+    fs.writeFileSync(confPath, sshConfig);
+    try {
+      const raw = execFileSync("ssh", [
+        "-T",
+        "-F",
+        confPath,
+        `openshell-${sandboxName}`,
+        "python3 - <<'PY'\nimport json, os\npath=os.path.expanduser('~/.openclaw/openclaw.json')\ntry:\n    cfg=json.load(open(path))\nexcept Exception:\n    print('{}')\n    raise SystemExit(0)\nproviders=((cfg.get('models') or {}).get('providers') or {})\nout={}\nfor name in ('nvidia','ollama','inference'):\n    val=providers.get(name)\n    if isinstance(val, dict):\n        models=val.get('models') or []\n        mids=[m.get('id') for m in models if isinstance(m, dict) and m.get('id')]\n        if mids:\n            out[name]=mids\nprint(json.dumps(out))\nPY",
+      ], {
+        encoding: "utf-8",
+        timeout: 30000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const parsed = JSON.parse(raw.trim() || "{}");
+      return {
+        nvidia: parsed.nvidia?.[0] || null,
+        ollama: parsed.ollama?.[0] || null,
+      };
+    } finally {
+      try { fs.unlinkSync(confPath); } catch {}
+    }
+  } catch {
+    return { nvidia: null, ollama: null };
+  }
+}
+
+function buildAgentCommand(message, sessionId, user, options = {}) {
+  const escaped = message.replace(/'/g, "'\\''");
+  const setupLines = [
+    `export NVIDIA_API_KEY='${sh(API_KEY)}'`,
+    `export OPENAI_API_KEY='${sh(API_KEY)}'`,
+    "export NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache",
+    "export OPENCLAW_NO_RESPAWN=1",
+    `export NEMOCLAW_SLACK_USER_ID='${sh(user.slackUserId)}'`,
+    `export NEMOCLAW_SLACK_DISPLAY_NAME='${sh(user.slackDisplayName || user.slackUserId)}'`,
+    `export NEMOCLAW_USER_ROLES='${sh((user.roles || ["user"]).join(","))}'`,
+    `export NEMOCLAW_IS_ADMIN='${(user.roles || []).includes("admin") ? "1" : "0"}'`,
+    "source /sandbox/.bashrc 2>/dev/null",
+  ];
+  if (options.skipClaudeAuth) {
+    setupLines.push("unset ANTHROPIC_API_KEY");
+    setupLines.push("export NEMOCLAW_SKIP_CLAUDE_AUTH=1");
+  }
+  const scriptLines = [...setupLines];
+  scriptLines.push(`nemoclaw-start openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
+  return scriptLines.join("\n");
+}
+
+function syncSandboxSelectionConfig(user, provider, model) {
+  const selectionConfig = getProviderSelectionConfig(provider, model);
+  if (!selectionConfig) return;
+  const sandboxName = user.sandboxName;
+  let sshConfig;
+  try {
+    sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
+  } catch {
+    return;
+  }
+  const confPath = `/tmp/nemoclaw-sync-${sandboxName}-${Date.now()}.conf`;
+  fs.writeFileSync(confPath, sshConfig);
+  const remoteScript = [
+    "python3 - <<'PY'",
+    "import json, os",
+    "path = os.path.expanduser('~/.nemoclaw/config.json')",
+    "os.makedirs(os.path.dirname(path), exist_ok=True)",
+    `cfg = ${JSON.stringify(JSON.stringify({ ...selectionConfig, onboardedAt: new Date().toISOString() }))}`,
+    "json.dump(json.loads(cfg), open(path, 'w'), indent=2)",
+    "PY",
+  ].join("\n");
+  try {
+    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, remoteScript], {
+      encoding: "utf-8",
+      timeout: 30000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    try { fs.unlinkSync(confPath); } catch {}
+  }
+}
+
+function setSandboxPrimaryModel(user, primaryModelRef) {
+  const sandboxName = user.sandboxName;
+  let sshConfig;
+  try {
+    sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
+  } catch {
+    return;
+  }
+  const confPath = `/tmp/nemoclaw-primary-${sandboxName}-${Date.now()}.conf`;
+  fs.writeFileSync(confPath, sshConfig);
+  const remoteScript = [
+    "python3 - <<'PY'",
+    "import json, os",
+    "path = os.path.expanduser('~/.openclaw/openclaw.json')",
+    "cfg = json.load(open(path))",
+    `cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = ${JSON.stringify(primaryModelRef)}`,
+    "json.dump(cfg, open(path, 'w'), indent=2)",
+    "os.chmod(path, 0o600)",
+    "PY",
+  ].join("\n");
+  try {
+    execFileSync("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, remoteScript], {
+      encoding: "utf-8",
+      timeout: 30000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    try { fs.unlinkSync(confPath); } catch {}
+  }
+}
+
+function selectInferenceRoute(user, provider, model) {
+  execFileSync(OPENSHELL, ["gateway", "select", "nemoclaw"], {
+    encoding: "utf-8",
+    timeout: 30000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const env = { ...process.env };
+  if (provider === "nvidia-nim") {
+    env.OPENAI_API_KEY = API_KEY;
+  } else if (provider === "ollama-local") {
+    env.OPENAI_API_KEY = "ollama";
+  }
+  execFileSync(OPENSHELL, ["inference", "set", "--no-verify", "--provider", provider, "--model", model], {
+    encoding: "utf-8",
+    timeout: 30000,
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  });
+  syncSandboxSelectionConfig(user, provider, model);
+  if (provider === "nvidia-nim") {
+    setSandboxPrimaryModel(user, `nvidia/${model}`);
+  } else if (provider === "ollama-local") {
+    setSandboxPrimaryModel(user, `ollama/${model}`);
+  } else if (provider === "anthropic-prod") {
+    setSandboxPrimaryModel(user, `anthropic/${model}`);
+  }
+}
+
 // ── Run agent inside sandbox ──────────────────────────────────────
 
-function runAgentInSandbox(message, sessionId, user) {
+function runAgentInSandbox(message, sessionId, user, options = {}) {
   return new Promise((resolve) => {
     const sandboxName = user.sandboxName;
     let sshConfig;
@@ -887,8 +1061,7 @@ function runAgentInSandbox(message, sessionId, user) {
     const confPath = `/tmp/nemoclaw-slack-ssh-${sessionId}.conf`;
     fs.writeFileSync(confPath, sshConfig);
 
-    const escaped = message.replace(/'/g, "'\\''");
-    const cmd = `export NVIDIA_API_KEY='${sh(API_KEY)}' && export NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache && export OPENCLAW_NO_RESPAWN=1 && export NEMOCLAW_SLACK_USER_ID='${sh(user.slackUserId)}' && export NEMOCLAW_SLACK_DISPLAY_NAME='${sh(user.slackDisplayName || user.slackUserId)}' && export NEMOCLAW_USER_ROLES='${sh((user.roles || ["user"]).join(","))}' && export NEMOCLAW_IS_ADMIN='${(user.roles || []).includes("admin") ? "1" : "0"}' && source /sandbox/.bashrc 2>/dev/null; nemoclaw-start openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`;
+    const cmd = buildAgentCommand(message, sessionId, user, options);
 
     const proc = spawn("ssh", ["-T", "-F", confPath, `openshell-${sandboxName}`, cmd], {
       timeout: 600000,
@@ -1044,6 +1217,7 @@ async function main() {
     }
 
     if (!text) return;
+    text = canonicalizeAdminCommand(text);
 
     // User registry lookup replaces ALLOWED_USERS
     const user = getUser(event.user);
@@ -1145,6 +1319,11 @@ async function main() {
       return;
     }
 
+    if (isDM && user && isAdminUser(user) && looksLikeAdminCommand(text)) {
+      await reply("Unknown admin command. Use `!admin-help`. Admin commands are handled directly and are not sent to the sandbox agent.");
+      return;
+    }
+
     // ── !setup commands (self-service onboarding) ──────────────
     if (isSetupCommand(text)) {
       // !setup help is available to everyone (normalize for mobile keyboard artifacts)
@@ -1216,6 +1395,12 @@ async function main() {
         text: "Working on it...",
       });
 
+      try {
+        setSandboxPrimaryModel(user, "anthropic/claude-sonnet-4-6");
+      } catch (err) {
+        console.error(`[${channel}] failed to normalize Anthropic primary model for ${user.sandboxName}: ${err.message}`);
+      }
+
       let response = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}`, user);
       console.log(`[${channel}] ${user.sandboxName} → ${displayName}: ${response.slice(0, 100)}...`);
 
@@ -1231,6 +1416,56 @@ async function main() {
         if (refreshCredentials(user.sandboxName, user.credentialsDir || "")) {
           response = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}-retry`, user);
           console.log(`[${channel}] ${user.sandboxName} → ${displayName} (retry): ${response.slice(0, 100)}...`);
+        }
+        if (AUTH_ERROR_RE.test(response)) {
+          if (requestLikelyNeedsMcp(text)) {
+            response = `${buildAuthRecoveryMessage(user)}\n\nThis request appears to require Freshrelease/MCP tooling. NVIDIA fallback is available for plain text generation, but it is not reliable for this tool-driven workflow.`;
+          } else {
+          const fallbackModels = getRuntimeFallbackModels(user.sandboxName);
+          console.log(`[${channel}] fallback models for ${user.sandboxName}:`, fallbackModels);
+          try {
+            if (fallbackModels.nvidia) {
+              selectInferenceRoute(user, "nvidia-nim", fallbackModels.nvidia);
+              const nvidiaResponse = await runAgentInSandbox(
+                text,
+                `${event.user}-${channel}-${Date.now()}-nvidia`,
+                user,
+                { skipClaudeAuth: true }
+              );
+              console.log(`[${channel}] ${user.sandboxName} → ${displayName} (nvidia fallback): ${nvidiaResponse.slice(0, 100)}...`);
+              if (!AUTH_ERROR_RE.test(nvidiaResponse) && !/Unknown model:/i.test(nvidiaResponse)) {
+                response = `[fallback: NVIDIA Nemotron]\n${nvidiaResponse}`;
+              } else if (fallbackModels.ollama) {
+                selectInferenceRoute(user, "ollama-local", fallbackModels.ollama);
+                const ollamaResponse = await runAgentInSandbox(
+                  text,
+                  `${event.user}-${channel}-${Date.now()}-ollama`,
+                  user,
+                  { skipClaudeAuth: true }
+                );
+                console.log(`[${channel}] ${user.sandboxName} → ${displayName} (ollama fallback): ${ollamaResponse.slice(0, 100)}...`);
+                if (!AUTH_ERROR_RE.test(ollamaResponse) && !/Unknown model:/i.test(ollamaResponse)) {
+                  response = `[fallback: local Ollama]\n${ollamaResponse}`;
+                } else {
+                  response = `${buildAuthRecoveryMessage(user)}\n\nNVIDIA and Ollama fallbacks also did not recover this request.`;
+                }
+              } else {
+                response = `${buildAuthRecoveryMessage(user)}\n\nNVIDIA fallback did not recover this request, and no Ollama model is configured in the sandbox runtime.`;
+              }
+            } else {
+              response = `${buildAuthRecoveryMessage(user)}\n\nNo NVIDIA fallback model is configured in the sandbox runtime.`;
+            }
+          } catch (fallbackErr) {
+            response = `${buildAuthRecoveryMessage(user)}\n\nFallback routing failed: ${fallbackErr.message}`;
+          } finally {
+            try {
+              syncSandboxSelectionConfig(user, "anthropic-prod", "claude-sonnet-4-6");
+              setSandboxPrimaryModel(user, "anthropic/claude-sonnet-4-6");
+            } catch (restoreErr) {
+              console.error(`[${channel}] failed to restore Anthropic route for ${user.sandboxName}: ${restoreErr.message}`);
+            }
+          }
+          }
         }
       }
 
@@ -1291,6 +1526,8 @@ module.exports = {
   isShowClawsCommand,
   isShowUserCommand,
   isAdminHelpCommand,
+  canonicalizeAdminCommand,
+  looksLikeAdminCommand,
   isAddClawCommand,
   isDeleteClawCommand,
   isConfirmDeleteClawCommand,
@@ -1316,4 +1553,7 @@ module.exports = {
   formatAdminHelp,
   getClaudeCredentialSource,
   describeClaudeCredentialSource,
+  buildAuthRecoveryMessage,
+  buildAgentCommand,
+  getRuntimeFallbackModels,
 };

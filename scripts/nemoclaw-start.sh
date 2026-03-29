@@ -117,6 +117,10 @@ PYAUTH
 
 extract_anthropic_key() {
   # Extract ANTHROPIC_API_KEY from Claude credentials if not already set
+  if [ "${NEMOCLAW_SKIP_CLAUDE_AUTH:-0}" = "1" ]; then
+    echo "[credentials] skipping Claude credential extraction"
+    return
+  fi
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     return
   fi
