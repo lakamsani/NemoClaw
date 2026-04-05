@@ -64,7 +64,7 @@ Shared control files:
 
 ## Runtime Policy
 
-Shared runtime policy is defined in [config/multi-user/runtime.json](/home/vamsee/NemoClaw-multi-user-claude/config/multi-user/runtime.json).
+Shared runtime policy is defined in [config/multi-user/runtime.json](config/multi-user/runtime.json).
 
 It controls:
 
@@ -76,8 +76,8 @@ It controls:
 
 Implementation helpers:
 
-- [bin/lib/runtime-config.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/runtime-config.js)
-- [bin/lib/sandbox-lifecycle.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/sandbox-lifecycle.js)
+- [bin/lib/runtime-config.js](bin/lib/runtime-config.js)
+- [bin/lib/sandbox-lifecycle.js](bin/lib/sandbox-lifecycle.js)
 
 ### Sandbox Lifecycle
 
@@ -85,9 +85,9 @@ The recovery baseline no longer treats wrapper noise as authoritative. If a sand
 
 This is now used by:
 
-- [bin/lib/bootstrap.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/bootstrap.js)
-- [bin/lib/reconcile.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/reconcile.js)
-- [bin/nemoclaw.js](/home/vamsee/NemoClaw-multi-user-claude/bin/nemoclaw.js)
+- [bin/lib/bootstrap.js](bin/lib/bootstrap.js)
+- [bin/lib/reconcile.js](bin/lib/reconcile.js)
+- [bin/nemoclaw.js](bin/nemoclaw.js)
 
 ---
 
@@ -132,7 +132,7 @@ That policy is documented as the intended operating model even where some live p
 
 ### Slack
 
-[scripts/slack-bridge-multi.js](/home/vamsee/NemoClaw-multi-user-claude/scripts/slack-bridge-multi.js) is the main user-facing bridge.
+[scripts/slack-bridge-multi.js](scripts/slack-bridge-multi.js) is the main user-facing bridge.
 
 Current capabilities validated during sanity testing:
 
@@ -148,7 +148,7 @@ Current capabilities validated during sanity testing:
 
 ### WhatsApp
 
-[scripts/whatsapp-bridge-multi.js](/home/vamsee/NemoClaw-multi-user-claude/scripts/whatsapp-bridge-multi.js) remains in place. Core routing and preserved auth state were carried forward, but WhatsApp was not the main focus of the initial sanity pass.
+[scripts/whatsapp-bridge-multi.js](scripts/whatsapp-bridge-multi.js) remains in place. Core routing and preserved auth state were carried forward, but WhatsApp was not the main focus of the initial sanity pass.
 
 ---
 
@@ -168,7 +168,7 @@ Freshrelease is now intentionally kept off MCP.
 
 ### Deterministic helper
 
-- [scripts/freshrelease-epics.py](/home/vamsee/NemoClaw-multi-user-claude/scripts/freshrelease-epics.py)
+- [scripts/freshrelease-epics.py](scripts/freshrelease-epics.py)
 
 Current supported natural-language coverage includes:
 
@@ -201,7 +201,7 @@ Google access currently uses a host-side helper rather than sandbox egress.
 
 Helper:
 
-- [scripts/gog-query.py](/home/vamsee/NemoClaw-multi-user-claude/scripts/gog-query.py)
+- [scripts/gog-query.py](scripts/gog-query.py)
 
 Reasons:
 
@@ -224,7 +224,7 @@ The direct `openshell sandbox ssh-config ...` plus `ssh -L ...` path was unrelia
 
 ```bash
 docker exec -i openshell-cluster-nemoclaw \
-  kubectl port-forward --address 0.0.0.0 -n openshell pod/veyonce-claw 18889:18789
+  kubectl port-forward --address 0.0.0.0 -n openshell pod/<sandbox-name> 18889:18789
 ```
 
 2. From a laptop, forward that host port locally:
@@ -256,8 +256,8 @@ Notes:
 
 Primary registry files:
 
-- [users.json](~/.nemoclaw/users.json)
-- [sandboxes.json](~/.nemoclaw/sandboxes.json)
+- `~/.nemoclaw/users.json`
+- `~/.nemoclaw/sandboxes.json`
 
 The current system preserves:
 
@@ -283,7 +283,7 @@ persist/users/<slack-user-id>/
 
 Shared workspace defaults now live in repo-owned files under:
 
-- [persist/workspace](/home/vamsee/NemoClaw-multi-user-claude/persist/workspace)
+- [persist/workspace](persist/workspace)
 
 These defaults include:
 
@@ -347,13 +347,13 @@ Before pushing, the worktree should be split so product code/docs are committed,
 
 Main implementation files:
 
-- [bin/lib/migration.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/migration.js)
-- [bin/lib/bootstrap.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/bootstrap.js)
-- [bin/lib/reconcile.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/reconcile.js)
+- [bin/lib/migration.js](bin/lib/migration.js)
+- [bin/lib/bootstrap.js](bin/lib/bootstrap.js)
+- [bin/lib/reconcile.js](bin/lib/reconcile.js)
 
 Live snapshot:
 
-- [live-snapshot](/home/vamsee/NemoClaw-multi-user-claude/persist/migration/live-snapshot)
+- [live-snapshot](persist/migration/live-snapshot)
 
 ---
 
@@ -423,15 +423,15 @@ The system is now moving toward:
 
 | File | Purpose |
 |------|---------|
-| [bin/nemoclaw.js](/home/vamsee/NemoClaw-multi-user-claude/bin/nemoclaw.js) | CLI entry point and user lifecycle commands |
-| [bin/lib/runtime-config.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/runtime-config.js) | Shared multi-user runtime config loader |
-| [bin/lib/sandbox-lifecycle.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/sandbox-lifecycle.js) | Health-first sandbox create/readiness helpers |
-| [bin/lib/migration.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/migration.js) | Export/import/inspect/restore tooling |
-| [bin/lib/bootstrap.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/bootstrap.js) | Sandbox bootstrap/adopt flow |
-| [bin/lib/reconcile.js](/home/vamsee/NemoClaw-multi-user-claude/bin/lib/reconcile.js) | Credential reconcile flow |
-| [scripts/slack-bridge-multi.js](/home/vamsee/NemoClaw-multi-user-claude/scripts/slack-bridge-multi.js) | Main multi-user Slack bridge |
-| [scripts/freshrelease-epics.py](/home/vamsee/NemoClaw-multi-user-claude/scripts/freshrelease-epics.py) | Deterministic Freshrelease helper |
-| [scripts/gog-query.py](/home/vamsee/NemoClaw-multi-user-claude/scripts/gog-query.py) | Host-side Google helper |
-| [scripts/inject-user-credentials.sh](/home/vamsee/NemoClaw-multi-user-claude/scripts/inject-user-credentials.sh) | Per-user credential injection |
-| [scripts/nemoclaw-resilience.sh](/home/vamsee/NemoClaw-multi-user-claude/scripts/nemoclaw-resilience.sh) | Full bring-up / recovery script |
-| [docs/reference/multi-user-runtime.md](/home/vamsee/NemoClaw-multi-user-claude/docs/reference/multi-user-runtime.md) | Runtime policy reference |
+| [bin/nemoclaw.js](bin/nemoclaw.js) | CLI entry point and user lifecycle commands |
+| [bin/lib/runtime-config.js](bin/lib/runtime-config.js) | Shared multi-user runtime config loader |
+| [bin/lib/sandbox-lifecycle.js](bin/lib/sandbox-lifecycle.js) | Health-first sandbox create/readiness helpers |
+| [bin/lib/migration.js](bin/lib/migration.js) | Export/import/inspect/restore tooling |
+| [bin/lib/bootstrap.js](bin/lib/bootstrap.js) | Sandbox bootstrap/adopt flow |
+| [bin/lib/reconcile.js](bin/lib/reconcile.js) | Credential reconcile flow |
+| [scripts/slack-bridge-multi.js](scripts/slack-bridge-multi.js) | Main multi-user Slack bridge |
+| [scripts/freshrelease-epics.py](scripts/freshrelease-epics.py) | Deterministic Freshrelease helper |
+| [scripts/gog-query.py](scripts/gog-query.py) | Host-side Google helper |
+| [scripts/inject-user-credentials.sh](scripts/inject-user-credentials.sh) | Per-user credential injection |
+| [scripts/nemoclaw-resilience.sh](scripts/nemoclaw-resilience.sh) | Full bring-up / recovery script |
+| [docs/reference/multi-user-runtime.md](docs/reference/multi-user-runtime.md) | Runtime policy reference |
