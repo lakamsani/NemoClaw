@@ -369,6 +369,22 @@ if [ "$GATEWAY_HEALTHY" != "true" ]; then
 fi
 info "Gateway started and healthy"
 
+# ── Step 5b: Re-apply per-user primary model + clean .tmp files ──
+# Gateway restart resets openclaw.json to baked-in defaults.
+if [ -n "$CRED_DIR" ] && [ -f "$(dirname "$CRED_DIR")/credentials/primary-model.txt" ]; then
+  PM="$(cat "$(dirname "$CRED_DIR")/credentials/primary-model.txt" | tr -d '[:space:]')"
+  [ -n "$PM" ] && ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path) or not os.access(path, os.W_OK): exit(0)
+cfg = json.load(open(path))
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = '${PM}'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null && info "Primary model re-applied: $PM"
+fi
+ssh_cmd 'rm -f /sandbox/.openclaw/agents/main/agent/*.tmp' 2>/dev/null || true
+
 # ── Step 6: Restore workspace personality files ──────────────────
 # Try per-user workspace first, then fall back to default
 PERSIST_DIR=""

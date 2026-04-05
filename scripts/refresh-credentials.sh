@@ -287,3 +287,25 @@ fi
 if [ -n "$MCP_CACHE" ]; then
   base64 "$MCP_CACHE" | ssh_cmd 'base64 -d > /sandbox/.claude/mcp-needs-auth-cache.json && chmod 600 /sandbox/.claude/mcp-needs-auth-cache.json'
 fi
+
+# ── Re-apply per-user primary model (MUST run AFTER gateway restart) ──
+# Gateway restart resets openclaw.json to baked-in defaults (Anthropic).
+# This re-applies the user's preferred model from persist.
+if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/primary-model.txt" ]; then
+  PRIMARY_MODEL="$(cat "$CRED_DIR/primary-model.txt" | tr -d '[:space:]')"
+  if [ -n "$PRIMARY_MODEL" ]; then
+    ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path) or not os.access(path, os.W_OK): exit(0)
+cfg = json.load(open(path))
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = '${PRIMARY_MODEL}'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+    echo "[refresh] Primary model re-applied: ${PRIMARY_MODEL} for $SANDBOX ($(date))"
+  fi
+fi
+
+# ── Clean stale .tmp files (prevent ENOENT on atomic rename) ──
+ssh_cmd 'rm -f /sandbox/.openclaw/agents/main/agent/*.tmp' 2>/dev/null || true
