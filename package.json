@@ -19,6 +19,7 @@
     "prepublishOnly": "cd nemoclaw && env -u npm_config_global -u npm_config_prefix -u npm_config_omit npm install --ignore-scripts && ./node_modules/.bin/tsc"
   },
   "dependencies": {
+    "@slack/bolt": "^4.2.0",
     "p-retry": "^4.6.2",
     "yaml": "^2.8.3"
   },

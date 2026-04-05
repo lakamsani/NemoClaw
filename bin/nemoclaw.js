@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const { execFileSync, spawnSync } = require("child_process");
+const { execFileSync, execSync, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -23,6 +23,7 @@ const YW = _useColor ? "\x1b[1;33m" : "";
 
 const {
   ROOT,
+  SCRIPTS,
   run,
   runCapture: _runCapture,
   runInteractive,
@@ -30,9 +31,15 @@ const {
   validateName,
 } = require("./lib/runner");
 const { resolveOpenshell } = require("./lib/resolve-openshell");
-const { startGatewayForRecovery } = require("./lib/onboard");
-const { getCredential } = require("./lib/credentials");
+const { startGatewayForRecovery, pruneStaleSandboxEntry } = require("./lib/onboard");
+const {
+  ensureApiKey,
+  ensureGithubToken,
+  getCredential,
+  isRepoPrivate,
+} = require("./lib/credentials");
 const registry = require("./lib/registry");
+const userReg = require("./lib/user-registry");
 const nim = require("./lib/nim");
 const policies = require("./lib/policies");
 const { parseGatewayInference } = require("./lib/inference-config");
@@ -40,7 +47,6 @@ const { getVersion } = require("./lib/version");
 const onboardSession = require("./lib/onboard-session");
 const { parseLiveSandboxNames } = require("./lib/runtime-recovery");
 const { NOTICE_ACCEPT_ENV, NOTICE_ACCEPT_FLAG } = require("./lib/usage-notice");
-const { executeDeploy } = require("../dist/lib/deploy");
 
 // ── Global commands ──────────────────────────────────────────────
 
@@ -55,6 +61,15 @@ const GLOBAL_COMMANDS = new Set([
   "status",
   "debug",
   "uninstall",
+  "user-add",
+  "user-remove",
+  "user-purge",
+  "user-list",
+  "user-status",
+  "user-enable",
+  "user-disable",
+  "user-grant-admin",
+  "user-revoke-admin",
   "help",
   "--help",
   "-h",
@@ -168,167 +183,6 @@ function getInstalledOpenshellVersion() {
 function stripAnsi(value = "") {
   // eslint-disable-next-line no-control-regex
   return String(value).replace(/\x1b\[[0-9;]*m/g, "");
-}
-
-// ── Sandbox process health (OpenClaw gateway inside the sandbox) ─────────
-
-/**
- * Run a command inside the sandbox via SSH and return { status, stdout, stderr }.
- * Returns null if SSH config cannot be obtained.
- */
-function executeSandboxCommand(sandboxName, command) {
-  const sshConfigResult = captureOpenshell(["sandbox", "ssh-config", sandboxName], {
-    ignoreError: true,
-  });
-  if (sshConfigResult.status !== 0) return null;
-
-  const tmpFile = path.join(os.tmpdir(), `nemoclaw-ssh-${process.pid}-${Date.now()}.conf`);
-  fs.writeFileSync(tmpFile, sshConfigResult.output, { mode: 0o600 });
-  try {
-    const result = spawnSync(
-      "ssh",
-      [
-        "-F",
-        tmpFile,
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "LogLevel=ERROR",
-        `openshell-${sandboxName}`,
-        command,
-      ],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 },
-    );
-    return {
-      status: result.status ?? 1,
-      stdout: (result.stdout || "").trim(),
-      stderr: (result.stderr || "").trim(),
-    };
-  } catch {
-    return null;
-  } finally {
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-/**
- * Check whether the OpenClaw gateway process is running inside the sandbox.
- * Uses the gateway's HTTP endpoint (port 18789) as the source of truth,
- * since the gateway runs as a separate user and pgrep may not see it.
- * Returns true (running), false (stopped), or null (cannot determine).
- */
-function isSandboxGatewayRunning(sandboxName) {
-  const result = executeSandboxCommand(
-    sandboxName,
-    "curl -sf --max-time 3 http://127.0.0.1:18789/ > /dev/null 2>&1 && echo RUNNING || echo STOPPED",
-  );
-  if (!result) return null;
-  if (result.stdout === "RUNNING") return true;
-  if (result.stdout === "STOPPED") return false;
-  return null;
-}
-
-/**
- * Restart the OpenClaw gateway process inside the sandbox after a pod restart.
- * Cleans stale lock/temp files, sources proxy config, and launches the gateway
- * in the background. Returns true on success.
- */
-function recoverSandboxProcesses(sandboxName) {
-  // The recovery script runs as the sandbox user (non-root). This matches
-  // the non-root fallback path in nemoclaw-start.sh — no privilege
-  // separation, but the gateway runs and inference works.
-  const script = [
-    // Source proxy config (written to .bashrc by nemoclaw-start on first boot)
-    "[ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null;",
-    // Re-check liveness before touching anything — another caller may have
-    // already recovered the gateway between our initial check and now (TOCTOU).
-    "if curl -sf --max-time 3 http://127.0.0.1:18789/ > /dev/null 2>&1; then echo ALREADY_RUNNING; exit 0; fi;",
-    // Clean stale lock files from the previous run (gateway checks these)
-    "rm -rf /tmp/openclaw-*/gateway.*.lock 2>/dev/null;",
-    // Clean stale temp files from the previous run
-    "rm -f /tmp/gateway.log /tmp/auto-pair.log;",
-    "touch /tmp/gateway.log; chmod 600 /tmp/gateway.log;",
-    "touch /tmp/auto-pair.log; chmod 600 /tmp/auto-pair.log;",
-    // Resolve and start gateway
-    'OPENCLAW="$(command -v openclaw)";',
-    'if [ -z "$OPENCLAW" ]; then echo OPENCLAW_MISSING; exit 1; fi;',
-    'nohup "$OPENCLAW" gateway run > /tmp/gateway.log 2>&1 &',
-    "GPID=$!; sleep 2;",
-    // Verify the gateway actually started (didn't crash immediately)
-    'if kill -0 "$GPID" 2>/dev/null; then echo "GATEWAY_PID=$GPID"; else echo GATEWAY_FAILED; cat /tmp/gateway.log 2>/dev/null | tail -5; fi',
-  ].join(" ");
-
-  const result = executeSandboxCommand(sandboxName, script);
-  if (!result) return false;
-  return (
-    result.status === 0 &&
-    (result.stdout.includes("GATEWAY_PID=") || result.stdout.includes("ALREADY_RUNNING"))
-  );
-}
-
-/**
- * Re-establish the dashboard port forward (18789) to the sandbox.
- */
-function ensureSandboxPortForward(sandboxName) {
-  runOpenshell(["forward", "stop", DASHBOARD_FORWARD_PORT], { ignoreError: true });
-  runOpenshell(["forward", "start", "--background", DASHBOARD_FORWARD_PORT, sandboxName], {
-    ignoreError: true,
-  });
-}
-
-/**
- * Detect and recover from a sandbox that survived a gateway restart but
- * whose OpenClaw processes are not running. Returns an object describing
- * the outcome: { checked, wasRunning, recovered }.
- */
-function checkAndRecoverSandboxProcesses(sandboxName, { quiet = false } = {}) {
-  const running = isSandboxGatewayRunning(sandboxName);
-  if (running === null) {
-    return { checked: false, wasRunning: null, recovered: false };
-  }
-  if (running) {
-    return { checked: true, wasRunning: true, recovered: false };
-  }
-
-  // Gateway not running — attempt recovery
-  if (!quiet) {
-    console.log("");
-    console.log("  OpenClaw gateway is not running inside the sandbox (sandbox likely restarted).");
-    console.log("  Recovering...");
-  }
-
-  const recovered = recoverSandboxProcesses(sandboxName);
-  if (recovered) {
-    // Wait for gateway to bind its HTTP port before declaring success
-    spawnSync("sleep", ["3"]);
-    if (isSandboxGatewayRunning(sandboxName) !== true) {
-      // Gateway process started but HTTP endpoint never came up
-      if (!quiet) {
-        console.error("  Gateway process started but is not responding.");
-        console.error("  Check /tmp/gateway.log inside the sandbox for details.");
-      }
-      return { checked: true, wasRunning: false, recovered: false };
-    }
-    ensureSandboxPortForward(sandboxName);
-    if (!quiet) {
-      console.log(`  ${G}✓${R} OpenClaw gateway restarted inside sandbox.`);
-      console.log(`  ${G}✓${R} Dashboard port forward re-established.`);
-    }
-  } else if (!quiet) {
-    console.error("  Could not restart OpenClaw gateway automatically.");
-    console.error("  Connect to the sandbox and run manually:");
-    console.error("    nohup openclaw gateway run > /tmp/gateway.log 2>&1 &");
-  }
-
-  return { checked: true, wasRunning: false, recovered };
 }
 
 function buildRecoveredSandboxEntry(name, metadata = {}) {
@@ -802,33 +656,139 @@ async function setup(args = []) {
   await onboard(args);
 }
 
-async function setupSpark(args = []) {
-  console.log("");
-  console.log("  ⚠  `nemoclaw setup-spark` is deprecated.");
-  console.log("  Current OpenShell releases handle the old DGX Spark cgroup issue themselves.");
-  console.log("  Use `nemoclaw onboard` instead.");
-  console.log("");
-  await onboard(args);
+async function setupSpark() {
+  // setup-spark.sh configures Docker cgroups — it does not use NVIDIA_API_KEY.
+  run(`sudo bash "${SCRIPTS}/setup-spark.sh"`);
 }
 
+// eslint-disable-next-line complexity
 async function deploy(instanceName) {
-  await executeDeploy({
-    instanceName,
-    env: process.env,
-    rootDir: ROOT,
-    getCredential,
-    validateName,
-    shellQuote,
-    run,
-    runInteractive,
-    execFileSync: (file, args, opts = {}) =>
-      String(execFileSync(file, args, { encoding: "utf-8", ...opts })),
-    spawnSync,
-    log: console.log,
-    error: console.error,
-    stdoutWrite: (message) => process.stdout.write(message),
-    exit: (code) => process.exit(code),
-  });
+  if (!instanceName) {
+    console.error("  Usage: nemoclaw deploy <instance-name>");
+    console.error("");
+    console.error("  Examples:");
+    console.error("    nemoclaw deploy my-gpu-box");
+    console.error("    nemoclaw deploy nemoclaw-prod");
+    console.error("    nemoclaw deploy nemoclaw-test");
+    process.exit(1);
+  }
+  await ensureApiKey();
+  if (isRepoPrivate("NVIDIA/OpenShell")) {
+    await ensureGithubToken();
+  }
+  validateName(instanceName, "instance name");
+  const name = instanceName;
+  const qname = shellQuote(name);
+  const gpu = process.env.NEMOCLAW_GPU || "a2-highgpu-1g:nvidia-tesla-a100:1";
+
+  console.log("");
+  console.log(`  Deploying NemoClaw to Brev instance: ${name}`);
+  console.log("");
+
+  try {
+    execFileSync("which", ["brev"], { stdio: "ignore" });
+  } catch {
+    console.error("brev CLI not found. Install: https://brev.nvidia.com");
+    process.exit(1);
+  }
+
+  let exists = false;
+  try {
+    const out = execFileSync("brev", ["ls"], { encoding: "utf-8" });
+    exists = out.includes(name);
+  } catch (err) {
+    if (err.stdout && err.stdout.includes(name)) exists = true;
+    if (err.stderr && err.stderr.includes(name)) exists = true;
+  }
+
+  if (!exists) {
+    console.log(`  Creating Brev instance '${name}' (${gpu})...`);
+    run(`brev create ${qname} --gpu ${shellQuote(gpu)}`);
+  } else {
+    console.log(`  Brev instance '${name}' already exists.`);
+  }
+
+  run(`brev refresh`, { ignoreError: true });
+
+  process.stdout.write(`  Waiting for SSH `);
+  for (let i = 0; i < 60; i++) {
+    try {
+      execFileSync(
+        "ssh",
+        ["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", name, "echo", "ok"],
+        { encoding: "utf-8", stdio: "ignore" },
+      );
+      process.stdout.write(` ${G}✓${R}\n`);
+      break;
+    } catch {
+      if (i === 59) {
+        process.stdout.write("\n");
+        console.error(`  Timed out waiting for SSH to ${name}`);
+        process.exit(1);
+      }
+      process.stdout.write(".");
+      spawnSync("sleep", ["3"]);
+    }
+  }
+
+  console.log("  Syncing NemoClaw to VM...");
+  run(
+    `ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ${qname} 'mkdir -p /home/ubuntu/nemoclaw'`,
+  );
+  run(
+    `rsync -az --delete --exclude node_modules --exclude .git --exclude src -e "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR" "${ROOT}/scripts" "${ROOT}/Dockerfile" "${ROOT}/nemoclaw" "${ROOT}/nemoclaw-blueprint" "${ROOT}/bin" "${ROOT}/package.json" ${qname}:/home/ubuntu/nemoclaw/`,
+  );
+
+  const envLines = [`NVIDIA_API_KEY=${shellQuote(process.env.NVIDIA_API_KEY || "")}`];
+  const ghToken = process.env.GITHUB_TOKEN;
+  if (ghToken) envLines.push(`GITHUB_TOKEN=${shellQuote(ghToken)}`);
+  const tgToken = getCredential("TELEGRAM_BOT_TOKEN");
+  if (tgToken) envLines.push(`TELEGRAM_BOT_TOKEN=${shellQuote(tgToken)}`);
+  const discordToken = getCredential("DISCORD_BOT_TOKEN");
+  if (discordToken) envLines.push(`DISCORD_BOT_TOKEN=${shellQuote(discordToken)}`);
+  const slackToken = getCredential("SLACK_BOT_TOKEN");
+  if (slackToken) envLines.push(`SLACK_BOT_TOKEN=${shellQuote(slackToken)}`);
+  const envDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-env-"));
+  const envTmp = path.join(envDir, "env");
+  fs.writeFileSync(envTmp, envLines.join("\n") + "\n", { mode: 0o600 });
+  try {
+    run(
+      `scp -q -o StrictHostKeyChecking=no -o LogLevel=ERROR ${shellQuote(envTmp)} ${qname}:/home/ubuntu/nemoclaw/.env`,
+    );
+    run(
+      `ssh -q -o StrictHostKeyChecking=no -o LogLevel=ERROR ${qname} 'chmod 600 /home/ubuntu/nemoclaw/.env'`,
+    );
+  } finally {
+    try {
+      fs.unlinkSync(envTmp);
+    } catch {
+      /* ignored */
+    }
+    try {
+      fs.rmdirSync(envDir);
+    } catch {
+      /* ignored */
+    }
+  }
+
+  console.log("  Running setup...");
+  runInteractive(
+    `ssh -t -o StrictHostKeyChecking=no -o LogLevel=ERROR ${qname} 'cd /home/ubuntu/nemoclaw && set -a && . .env && set +a && bash scripts/brev-setup.sh'`,
+  );
+
+  if (tgToken) {
+    console.log("  Starting services...");
+    run(
+      `ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ${qname} 'cd /home/ubuntu/nemoclaw && set -a && . .env && set +a && bash scripts/start-services.sh'`,
+    );
+  }
+
+  console.log("");
+  console.log("  Connecting to sandbox...");
+  console.log("");
+  runInteractive(
+    `ssh -t -o StrictHostKeyChecking=no -o LogLevel=ERROR ${qname} 'cd /home/ubuntu/nemoclaw && set -a && . .env && set +a && openshell sandbox connect nemoclaw'`,
+  );
 }
 
 async function start() {
@@ -976,6 +936,13 @@ async function listSandboxes() {
     return;
   }
 
+  // Build user-to-sandbox lookup
+  const { users } = userReg.listUsers();
+  const sandboxUserMap = {};
+  for (const u of users) {
+    sandboxUserMap[u.sandboxName] = u.slackDisplayName || u.slackUserId;
+  }
+
   // Query live gateway inference once; prefer it over stale registry values.
   const live = parseGatewayInference(
     captureOpenshell(["inference", "get"], { ignoreError: true }).output,
@@ -995,15 +962,447 @@ async function listSandboxes() {
   console.log("  Sandboxes:");
   for (const sb of sandboxes) {
     const def = sb.name === defaultSandbox ? " *" : "";
+    const owner = sandboxUserMap[sb.name] || "-";
     const model = (live && live.model) || sb.model || "unknown";
     const provider = (live && live.provider) || sb.provider || "unknown";
     const gpu = sb.gpuEnabled ? "GPU" : "CPU";
     const presets = sb.policies && sb.policies.length > 0 ? sb.policies.join(", ") : "none";
-    console.log(`    ${sb.name}${def}`);
-    console.log(`      model: ${model}  provider: ${provider}  ${gpu}  policies: ${presets}`);
+    console.log(`    ${owner.padEnd(12)} ${sb.name}${def}`);
+    console.log(`${"".padEnd(17)}model: ${model}  provider: ${provider}  ${gpu}  policies: ${presets}`);
   }
   console.log("");
   console.log("  * = default sandbox");
+  console.log("");
+}
+
+// ── User lifecycle commands ──────────────────────────────────────
+
+async function userAdd(args = []) {
+  const { prompt: askPrompt } = require("./lib/credentials");
+  const applyDefaultPolicies = async (sandboxNameForPolicies) => {
+    const defaultPresets = ["npm", "pypi", "slack"];
+    const allPresets = policies.listPresets();
+    const knownNames = new Set(allPresets.map((p) => p.name));
+
+    console.log("");
+    console.log("  Available policy presets:");
+    allPresets.forEach((p) => {
+      const suggested = defaultPresets.includes(p.name) ? " (default)" : "";
+      console.log(`    ○ ${p.name} — ${p.description}${suggested}`);
+    });
+    console.log("");
+
+    let selectedPresets = defaultPresets;
+    if (nonInteractive) {
+      console.log(`  [non-interactive] Applying default presets: ${defaultPresets.join(", ")}`);
+    } else {
+      const presetAnswer = await askPrompt(`  Apply default presets (${defaultPresets.join(", ")})? [Y/n/list]: `);
+
+      if (presetAnswer.toLowerCase() === "n") {
+        selectedPresets = [];
+        console.log("  Skipping policy presets.");
+      } else if (presetAnswer.toLowerCase() === "list") {
+        const picks = await askPrompt("  Enter preset names (comma-separated): ");
+        selectedPresets = picks.split(",").map((s) => s.trim()).filter(Boolean);
+        const invalid = selectedPresets.filter((n) => !knownNames.has(n));
+        if (invalid.length > 0) {
+          console.error(`  Unknown preset(s): ${invalid.join(", ")} — skipping those.`);
+          selectedPresets = selectedPresets.filter((n) => knownNames.has(n));
+        }
+      }
+    }
+
+    for (const preset of selectedPresets) {
+      try {
+        policies.applyPreset(sandboxNameForPolicies, preset);
+      } catch (err) {
+        console.error(`  Warning: failed to apply preset '${preset}': ${err.message}`);
+      }
+    }
+    if (selectedPresets.length > 0) {
+      console.log(`  Applied presets: ${selectedPresets.join(", ")}`);
+    }
+  };
+
+  // Parse --non-interactive mode with named args
+  const nonInteractive = args.includes("--non-interactive");
+  const argAdmin = args.includes("--admin");
+  let argSlackId, argDisplayName, argClawName, argGithubUser;
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--slack-id":      argSlackId = args[++i]; break;
+      case "--display-name":  argDisplayName = args[++i]; break;
+      case "--claw-name":     argClawName = args[++i]; break;
+      case "--github-user":   argGithubUser = args[++i]; break;
+    }
+  }
+
+  if (nonInteractive && (!argSlackId || !argDisplayName || !argClawName)) {
+    console.error("  Usage: nemoclaw user-add --non-interactive --slack-id <ID> --display-name <NAME> --claw-name <NAME> [--github-user <USER>] [--admin]");
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log("  NemoClaw — Register a new user");
+  console.log("");
+
+  const slackUserId = nonInteractive ? argSlackId : await askPrompt("  Slack user ID (e.g. U09R681EPQ9): ");
+  if (!slackUserId || !/^U[A-Z0-9]+$/.test(slackUserId)) {
+    console.error("  Invalid Slack user ID. Must start with U followed by alphanumeric characters.");
+    process.exit(1);
+  }
+
+  const existing = userReg.getUser(slackUserId);
+  if (existing) {
+    console.error(`  User ${slackUserId} already registered (sandbox: ${existing.sandboxName}).`);
+    console.error("  Run 'nemoclaw user-remove " + slackUserId + "' first to re-register.");
+    process.exit(1);
+  }
+
+  const slackDisplayName = nonInteractive ? argDisplayName : await askPrompt("  Slack display name: ");
+  const sandboxName = nonInteractive ? argClawName : await askPrompt("  Sandbox name (e.g. alice-claw): ");
+  if (!sandboxName || !/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(sandboxName)) {
+    console.error("  Invalid sandbox name. Use lowercase letters, numbers, and hyphens.");
+    process.exit(1);
+  }
+
+  const githubUser = nonInteractive ? (argGithubUser || "") : await askPrompt("  GitHub username (optional, press Enter to skip): ");
+
+  // Check if sandbox exists or needs to be created
+  let sbExists = registry.getSandbox(sandboxName);
+  const liveExists = pruneStaleSandboxEntry(sandboxName);
+  sbExists = registry.getSandbox(sandboxName);
+  if (!sbExists && liveExists) {
+    registry.registerSandbox({
+      name: sandboxName,
+      model: "anthropic/claude-sonnet-4-6",
+      provider: "openshell",
+      gpuEnabled: false,
+      policies: [],
+    });
+    sbExists = registry.getSandbox(sandboxName);
+    console.log(`  Found existing live sandbox '${sandboxName}'. Adopting it into the local registry.`);
+    await applyDefaultPolicies(sandboxName);
+  }
+
+  if (!sbExists) {
+    const create = nonInteractive ? "y" : await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
+    if (create.toLowerCase() !== "n") {
+      console.log(`  Creating sandbox '${sandboxName}' (this may take a few minutes on first run)...`);
+
+      // Stage build context (same as onboard flow)
+      const { mkdtempSync } = require("fs");
+      const buildCtx = mkdtempSync(path.join(os.tmpdir(), "nemoclaw-build-"));
+      fs.copyFileSync(path.join(ROOT, "Dockerfile"), path.join(buildCtx, "Dockerfile"));
+      execFileSync("cp", ["-r", path.join(ROOT, "nemoclaw"), path.join(buildCtx, "nemoclaw")], { stdio: "inherit" });
+      execFileSync("cp", ["-r", path.join(ROOT, "nemoclaw-blueprint"), path.join(buildCtx, "nemoclaw-blueprint")], { stdio: "inherit" });
+      execFileSync("cp", ["-r", path.join(ROOT, "scripts"), path.join(buildCtx, "scripts")], { stdio: "inherit" });
+      execFileSync("rm", ["-rf", path.join(buildCtx, "nemoclaw", "node_modules")], { stdio: "ignore" });
+
+      const basePolicyPath = path.join(ROOT, "nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml");
+      const envArgs = [];
+      if (process.env.NVIDIA_API_KEY) envArgs.push(`NVIDIA_API_KEY=${process.env.NVIDIA_API_KEY}`);
+
+      try {
+        execFileSync(
+          "openshell",
+          ["sandbox", "create", "--from", path.join(buildCtx, "Dockerfile"), "--name", sandboxName, "--policy", basePolicyPath, "--", "env", ...envArgs, "nemoclaw-start"],
+          { stdio: "inherit", timeout: 300000 }
+        );
+      } catch (err) {
+        console.error(`  Failed to create sandbox: ${err.message}`);
+        execFileSync("rm", ["-rf", buildCtx], { stdio: "ignore" });
+        process.exit(1);
+      }
+      execFileSync("rm", ["-rf", buildCtx], { stdio: "ignore" });
+
+      registry.registerSandbox({
+        name: sandboxName,
+        model: "anthropic/claude-sonnet-4-6",
+        provider: "openshell",
+        gpuEnabled: false,
+        policies: [],
+      });
+      console.log(`  Sandbox '${sandboxName}' created and registered.`);
+      await applyDefaultPolicies(sandboxName);
+    }
+  }
+
+  // Create per-user persist directories
+  const persistBase = `persist/users/${slackUserId}`;
+  const credDir = `${persistBase}/credentials`;
+  const workspaceDir = `${persistBase}/workspace`;
+  fs.mkdirSync(path.join(ROOT, credDir), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(ROOT, workspaceDir), { recursive: true });
+
+  // Copy default personality files if workspace is empty
+  const defaultWorkspace = path.join(ROOT, "persist", "workspace");
+  const userWorkspace = path.join(ROOT, workspaceDir);
+  if (fs.existsSync(defaultWorkspace)) {
+    const files = ["SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "AGENTS.md", "BOOTSTRAP.md"];
+    for (const f of files) {
+      const src = path.join(defaultWorkspace, f);
+      const dst = path.join(userWorkspace, f);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) {
+        fs.copyFileSync(src, dst);
+      }
+    }
+    console.log("  Default personality files copied to user workspace.");
+  }
+
+  // Register user
+  userReg.registerUser({
+    slackUserId,
+    slackDisplayName,
+    sandboxName,
+    githubUser,
+    personalityDir: workspaceDir,
+    credentialsDir: credDir,
+    enabled: true,
+    roles: argAdmin ? ["user", "admin"] : ["user"],
+  });
+
+  const roles = userReg.getUser(slackUserId)?.roles || ["user"];
+
+  console.log("");
+  console.log(`  User registered:`);
+  console.log(`    Slack ID:    ${slackUserId}`);
+  console.log(`    Name:        ${slackDisplayName}`);
+  console.log(`    Sandbox:     ${sandboxName}`);
+  console.log(`    GitHub:      ${githubUser || "(none)"}`);
+  console.log(`    Roles:       ${roles.join(", ")}`);
+  console.log(`    Credentials: ${credDir}`);
+  console.log(`    Workspace:   ${workspaceDir}`);
+  console.log("");
+  console.log("  Next steps:");
+  console.log(`    1. Place credentials in ${credDir}/`);
+  console.log("       (claude-credentials.json, gh-hosts.yml, gogcli/)");
+  console.log(`    2. Customize personality in ${workspaceDir}/`);
+  console.log(`    3. Run: scripts/inject-user-credentials.sh ${sandboxName} ${credDir}` + (githubUser ? ` --github-user ${githubUser}` : ""));
+  console.log("");
+}
+
+function userRemove(slackUserId) {
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw user-remove <slack-user-id>");
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  Removing user: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox: ${user.sandboxName}`);
+
+  userReg.removeUser(slackUserId);
+  console.log(`  User removed from registry.`);
+  console.log("");
+  console.log("  Note: Sandbox and persist files were NOT deleted.");
+  console.log(`  To also destroy the sandbox: nemoclaw ${user.sandboxName} destroy`);
+  console.log(`  To delete user data: rm -rf persist/users/${slackUserId}`);
+  console.log("");
+}
+
+function userPurge(args = []) {
+  // Parse arguments: --sandbox <name> or --slack-id <id>
+  let sandboxName, slackUserId;
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--sandbox":  sandboxName = args[++i]; break;
+      case "--slack-id": slackUserId = args[++i]; break;
+    }
+  }
+
+  if (!sandboxName && !slackUserId) {
+    console.error("  Usage: nemoclaw user-purge --sandbox <claw-name>");
+    console.error("         nemoclaw user-purge --slack-id <slack-user-id>");
+    process.exit(1);
+  }
+
+  // Resolve user from whichever identifier was given
+  let user;
+  if (slackUserId) {
+    user = userReg.getUser(slackUserId);
+  } else {
+    user = userReg.getUserBySandbox(sandboxName);
+  }
+
+  if (!user) {
+    // Even without a registry entry, allow purging by sandbox name
+    if (sandboxName) {
+      console.log("");
+      console.log(`  No user found for sandbox '${sandboxName}'. Destroying sandbox only.`);
+      const sb = registry.getSandbox(sandboxName);
+      if (sb) {
+        sandboxDestroy(sandboxName);
+        console.log(`  Sandbox '${sandboxName}' destroyed.`);
+      } else {
+        // Try openshell directly in case it exists but isn't registered
+        try {
+          execFileSync("openshell", ["sandbox", "delete", sandboxName], { stdio: "inherit" });
+          console.log(`  Sandbox '${sandboxName}' deleted via openshell.`);
+        } catch {
+          console.log(`  Sandbox '${sandboxName}' not found in openshell either.`);
+        }
+      }
+      console.log("");
+      return;
+    }
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  slackUserId = user.slackUserId;
+  sandboxName = user.sandboxName;
+
+  console.log("");
+  console.log(`  Purging user: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox:   ${sandboxName}`);
+  console.log("");
+
+  // Step 1: Destroy sandbox (NIM + openshell + sandbox registry)
+  const sb = registry.getSandbox(sandboxName);
+  if (sb) {
+    console.log("  [1/3] Destroying sandbox...");
+    sandboxDestroy(sandboxName);
+  } else {
+    console.log("  [1/3] Sandbox not in registry, attempting openshell delete...");
+    try {
+      execFileSync("openshell", ["sandbox", "delete", sandboxName], { stdio: "inherit" });
+    } catch {
+      console.log(`         Sandbox '${sandboxName}' not found — skipping.`);
+    }
+  }
+
+  // Step 2: Remove from user registry
+  console.log("  [2/3] Removing from user registry...");
+  userReg.removeUser(slackUserId);
+
+  // Step 3: Delete persist data
+  const persistDir = path.join(ROOT, "persist", "users", slackUserId);
+  console.log("  [3/3] Deleting persist data...");
+  if (fs.existsSync(persistDir)) {
+    fs.rmSync(persistDir, { recursive: true, force: true });
+    console.log(`         Removed ${persistDir}`);
+  } else {
+    console.log("         No persist directory found — skipping.");
+  }
+
+  console.log("");
+  console.log(`  User '${user.slackDisplayName}' (${slackUserId}) fully purged.`);
+  console.log("  Note: Restart the Slack bridge to stop routing messages for this user.");
+  console.log("");
+}
+
+function userList() {
+  const { users, defaultUser } = userReg.listUsers();
+  if (users.length === 0) {
+    console.log("");
+    console.log("  No users registered. Run 'nemoclaw user-add' to get started.");
+    console.log("");
+    return;
+  }
+
+  console.log("");
+  console.log("  Registered Users:");
+  for (const u of users) {
+    const def = u.slackUserId === defaultUser ? " *" : "";
+    const status = u.enabled ? "enabled" : "disabled";
+    console.log(`    ${u.slackDisplayName || u.slackUserId}${def}`);
+    console.log(`      slack: ${u.slackUserId}  sandbox: ${u.sandboxName}  github: ${u.githubUser || "-"}  ${status}  roles: ${(u.roles || ["user"]).join(",")}`);
+  }
+  console.log("");
+  console.log("  * = default user");
+  console.log("");
+}
+
+function userStatus(slackUserId) {
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw user-status <slack-user-id>");
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User: ${user.slackDisplayName} (${slackUserId})`);
+  console.log(`    Sandbox:     ${user.sandboxName}`);
+  console.log(`    GitHub:      ${user.githubUser || "-"}`);
+  console.log(`    Enabled:     ${user.enabled}`);
+  console.log(`    Roles:       ${(user.roles || ["user"]).join(", ")}`);
+  console.log(`    Credentials: ${user.credentialsDir}`);
+  console.log(`    Workspace:   ${user.personalityDir}`);
+  console.log(`    Created:     ${user.createdAt}`);
+
+  // Check sandbox health
+  try {
+    const out = execFileSync("openshell", ["sandbox", "list"], { encoding: "utf-8" });
+    if (out.includes(user.sandboxName)) {
+      const ready = out.includes(`${user.sandboxName}`) && out.includes("Ready");
+      console.log(`    Sandbox:     ${ready ? "Ready" : "Not Ready"}`);
+    } else {
+      console.log("    Sandbox:     Not found (not created?)");
+    }
+  } catch {
+    console.log("    Sandbox:     (cannot check — openshell not available)");
+  }
+  console.log("");
+}
+
+function userSetEnabled(slackUserId, enabled) {
+  if (!slackUserId) {
+    console.error(`  Usage: nemoclaw ${enabled ? "user-enable" : "user-disable"} <slack-user-id>`);
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  if (!userReg.updateUser(slackUserId, { enabled })) {
+    console.error(`  Failed to update ${slackUserId}.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User ${user.slackDisplayName || slackUserId} is now ${enabled ? "enabled" : "disabled"}.`);
+  console.log("");
+}
+
+function userSetAdmin(slackUserId, grantAdmin) {
+  if (!slackUserId) {
+    console.error(`  Usage: nemoclaw ${grantAdmin ? "user-grant-admin" : "user-revoke-admin"} <slack-user-id>`);
+    process.exit(1);
+  }
+
+  const user = userReg.getUser(slackUserId);
+  if (!user) {
+    console.error(`  User ${slackUserId} not found in registry.`);
+    process.exit(1);
+  }
+
+  const roles = new Set(user.roles || ["user"]);
+  roles.add("user");
+  if (grantAdmin) roles.add("admin");
+  else roles.delete("admin");
+
+  if (!userReg.updateUser(slackUserId, { roles: [...roles] })) {
+    console.error(`  Failed to update ${slackUserId}.`);
+    process.exit(1);
+  }
+
+  console.log("");
+  console.log(`  User ${user.slackDisplayName || slackUserId} roles: ${[...roles].join(", ")}`);
   console.log("");
 }
 
@@ -1011,7 +1410,6 @@ async function listSandboxes() {
 
 async function sandboxConnect(sandboxName) {
   await ensureLiveSandboxOrExit(sandboxName);
-  checkAndRecoverSandboxProcesses(sandboxName);
   const result = spawnSync(getOpenshellBinary(), ["sandbox", "connect", sandboxName], {
     stdio: "inherit",
     cwd: ROOT,
@@ -1099,28 +1497,6 @@ async function sandboxStatus(sandboxName) {
       console.log(lookup.output);
     }
     printGatewayLifecycleHint(lookup.output, sandboxName, console.log);
-  }
-
-  // OpenClaw process health inside the sandbox
-  if (lookup.state === "present") {
-    const processCheck = checkAndRecoverSandboxProcesses(sandboxName, { quiet: true });
-    if (processCheck.checked) {
-      if (processCheck.wasRunning) {
-        console.log(`    OpenClaw: ${G}running${R}`);
-      } else if (processCheck.recovered) {
-        console.log(`    OpenClaw: ${G}recovered${R} (gateway restarted after sandbox restart)`);
-      } else {
-        console.log(`    OpenClaw: ${_RD}not running${R}`);
-        console.log("");
-        console.log("  The sandbox is alive but the OpenClaw gateway process is not running.");
-        console.log("  This typically happens after a gateway restart (e.g., laptop close/open).");
-        console.log("");
-        console.log("  To recover, run:");
-        console.log(`    ${D}nemoclaw ${sandboxName} connect${R}  (auto-recovers on connect)`);
-        console.log("  Or manually inside the sandbox:");
-        console.log(`    ${D}nohup openclaw gateway run > /tmp/gateway.log 2>&1 &${R}`);
-      }
-    }
   }
 
   // NIM health
@@ -1263,6 +1639,7 @@ function help() {
   ${G}Getting Started:${R}
     ${B}nemoclaw onboard${R}                 Configure inference endpoint and credentials
                                     ${D}(non-interactive: ${NOTICE_ACCEPT_FLAG} or ${NOTICE_ACCEPT_ENV}=1)${R}
+    nemoclaw setup-spark             Set up on DGX Spark ${D}(fixes cgroup v2 + Docker)${R}
 
   ${G}Sandbox Management:${R}
     ${B}nemoclaw list${R}                    List all sandboxes
@@ -1275,10 +1652,20 @@ function help() {
     nemoclaw <name> policy-add       Add a network or filesystem policy preset
     nemoclaw <name> policy-list      List presets ${D}(● = applied)${R}
 
-  ${G}Compatibility Commands:${R}
-    nemoclaw setup                   Deprecated alias for ${B}nemoclaw onboard${R}
-    nemoclaw setup-spark             Deprecated alias for ${B}nemoclaw onboard${R}
-    nemoclaw deploy <instance>       Deprecated Brev-specific bootstrap path
+  ${G}Multi-User:${R}
+    nemoclaw user-add                Register a new user (interactive wizard)
+    nemoclaw user-remove <slack-id>  Remove a user from registry (keeps sandbox/data)
+    nemoclaw user-purge --sandbox <name>  Destroy sandbox + registry + persist data
+    nemoclaw user-purge --slack-id <id>   Same, by Slack user ID
+    nemoclaw user-list               List all registered users
+    nemoclaw user-status <slack-id>  Show user details and sandbox health
+    nemoclaw user-enable <slack-id>  Enable a registered user in the Slack bridge
+    nemoclaw user-disable <slack-id> Disable a registered user in the Slack bridge
+    nemoclaw user-grant-admin <id>   Grant admin role to a registered user
+    nemoclaw user-revoke-admin <id>  Revoke admin role from a registered user
+
+  ${G}Deploy:${R}
+    nemoclaw deploy <instance>       Deploy to a Brev VM and start services
 
   ${G}Services:${R}
     nemoclaw start                   Start auxiliary services ${D}(Telegram, tunnel)${R}
@@ -1325,7 +1712,7 @@ const [cmd, ...args] = process.argv.slice(2);
         await setup(args);
         break;
       case "setup-spark":
-        await setupSpark(args);
+        await setupSpark();
         break;
       case "deploy":
         await deploy(args[0]);
@@ -1347,6 +1734,33 @@ const [cmd, ...args] = process.argv.slice(2);
         break;
       case "list":
         await listSandboxes();
+        break;
+      case "user-add":
+        await userAdd(args);
+        break;
+      case "user-remove":
+        userRemove(args[0]);
+        break;
+      case "user-purge":
+        userPurge(args);
+        break;
+      case "user-list":
+        userList();
+        break;
+      case "user-status":
+        userStatus(args[0]);
+        break;
+      case "user-enable":
+        userSetEnabled(args[0], true);
+        break;
+      case "user-disable":
+        userSetEnabled(args[0], false);
+        break;
+      case "user-grant-admin":
+        userSetAdmin(args[0], true);
+        break;
+      case "user-revoke-admin":
+        userSetAdmin(args[0], false);
         break;
       case "--version":
       case "-v": {

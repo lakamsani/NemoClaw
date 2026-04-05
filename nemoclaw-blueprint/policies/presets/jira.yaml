@@ -3,28 +3,13 @@
 
 preset:
   name: jira
-  description: "Jira and Atlassian Cloud access"
+  description: "Jira and Atlassian Cloud access (scoped to Atlassian APIs, not wildcard)"
 
 network_policies:
   atlassian:
     name: atlassian
     endpoints:
-      - host: "*.atlassian.net"
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: GET, path: "/**" }
-          - allow: { method: POST, path: "/**" }
-      - host: auth.atlassian.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: terminate
-        rules:
-          - allow: { method: GET, path: "/**" }
-          - allow: { method: POST, path: "/**" }
+      # Atlassian REST API (covers Jira, Confluence, etc.)
       - host: api.atlassian.com
         port: 443
         protocol: rest
@@ -33,5 +18,23 @@ network_policies:
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
+      # Auth
+      - host: auth.atlassian.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+      # Instance-specific access — add your org's subdomain here:
+      # - host: your-org.atlassian.net
+      #   port: 443
+      #   protocol: rest
+      #   enforcement: enforce
+      #   tls: terminate
+      #   rules:
+      #     - allow: { method: GET, path: "/**" }
+      #     - allow: { method: POST, path: "/**" }
     binaries:
       - { path: /usr/local/bin/node }

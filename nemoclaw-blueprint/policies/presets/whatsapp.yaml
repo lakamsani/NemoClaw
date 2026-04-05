@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: whatsapp
+  description: "WhatsApp Web connectivity for OpenClaw channel"
+
+network_policies:
+  whatsapp:
+    name: whatsapp
+    endpoints:
+      - host: web.whatsapp.com
+        port: 443
+        access: full
+      - host: w1.web.whatsapp.com
+        port: 443
+        access: full
+      - host: w2.web.whatsapp.com
+        port: 443
+        access: full
+      - host: w3.web.whatsapp.com
+        port: 443
+        access: full
+      - host: mmg.whatsapp.net
+        port: 443
+        access: full
+      - host: pps.whatsapp.net
+        port: 443
+        access: full
+      - host: static.whatsapp.net
+        port: 443
+        access: full
+      - host: media.whatsapp.com
+        port: 443
+        access: full
+      - host: dit.whatsapp.net
+        port: 443
+        access: full
+      - host: graph.facebook.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }

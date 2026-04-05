@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: ollama
+  description: "Local Ollama inference (host.docker.internal:11434)"
+
+network_policies:
+  ollama:
+    name: ollama
+    endpoints:
+      - host: host.docker.internal
+        port: 11435
+        access: full
+      - host: host.openshell.internal
+        port: 11435
+        access: full
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
+      - { path: /usr/bin/curl }

@@ -3,7 +3,7 @@
 
 preset:
   name: npm
-  description: "npm and Yarn registry access"
+  description: "npm and Yarn registry access (read-only — install, not publish)"
 
 network_policies:
   npm_yarn:
@@ -11,10 +11,18 @@ network_policies:
     endpoints:
       - host: registry.npmjs.org
         port: 443
-        access: full
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
       - host: registry.yarnpkg.com
         port: 443
-        access: full
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
     binaries:
       - { path: /usr/local/bin/npm* }
       - { path: /usr/local/bin/npx* }
@@ -22,3 +30,4 @@ network_policies:
       - { path: /usr/local/bin/yarn* }
       - { path: /usr/bin/npm* }
       - { path: /usr/bin/node* }
+      - { path: /usr/local/bin/openclaw }

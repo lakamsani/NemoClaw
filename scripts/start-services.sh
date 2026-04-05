@@ -2,21 +2,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Start NemoClaw auxiliary services: Telegram bridge
-# and cloudflared tunnel for public access.
+# Start NemoClaw auxiliary services: Slack bridge.
 #
 # Usage:
-#   TELEGRAM_BOT_TOKEN=... ./scripts/start-services.sh         # start all
-#   ./scripts/start-services.sh --status                       # check status
-#   ./scripts/start-services.sh --stop                         # stop all
-#   ./scripts/start-services.sh --sandbox mybox                # start for specific sandbox
-#   ./scripts/start-services.sh --sandbox mybox --stop         # stop for specific sandbox
+#   SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... ./scripts/start-services.sh
+#   ./scripts/start-services.sh --status
+#   ./scripts/start-services.sh --stop
+#   ./scripts/start-services.sh --sandbox mybox
+#   ./scripts/start-services.sh --sandbox mybox --stop
+#
+# Optional env:
+#   ALLOWED_USERS     — comma-separated Slack user IDs to accept (default: all)
+#   ALLOWED_CHANNELS  — comma-separated Slack channel IDs to accept (default: all)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DASHBOARD_PORT="${DASHBOARD_PORT:-18789}"
+
+# Source .env if present (tokens, access control, sandbox name)
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$REPO_DIR/.env"
+  set +a
+fi
 
 # ── Parse flags ──────────────────────────────────────────────────
 SANDBOX_NAME="${NEMOCLAW_SANDBOX:-${SANDBOX_NAME:-default}}"
@@ -56,32 +66,79 @@ fail() {
   exit 1
 }
 
-is_running() {
+service_match_pattern() {
+  case "$1" in
+    slack-bridge) echo "node .*scripts/slack-bridge(-multi)?\\.js" ;;
+    whatsapp-bridge) echo "node .*scripts/whatsapp-bridge-multi\\.js" ;;
+    telegram-bridge) echo "node .*scripts/telegram-bridge\\.js" ;;
+    cloudflared)
+      if [ -n "${DASHBOARD_PORT:-}" ]; then
+        echo "cloudflared tunnel --url http://localhost:${DASHBOARD_PORT}"
+      else
+        echo "cloudflared tunnel --url http://localhost:"
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_running_pid() {
   local pidfile="$PIDDIR/$1.pid"
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    cat "$pidfile"
     return 0
   fi
+  rm -f "$pidfile"
+  if command -v pgrep >/dev/null 2>&1; then
+    local pattern
+    pattern="$(service_match_pattern "$1" || true)"
+    if [ -n "$pattern" ]; then
+      local pid
+      pid="$(pgrep -fo "$pattern" || true)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid" >"$pidfile"
+        echo "$pid"
+        return 0
+      fi
+    fi
+  fi
   return 1
+}
+
+is_running() {
+  resolve_running_pid "$1" >/dev/null
 }
 
 start_service() {
   local name="$1"
   shift
-  if is_running "$name"; then
-    info "$name already running (PID $(cat "$PIDDIR/$name.pid"))"
+  local existing_pid
+  if existing_pid="$(resolve_running_pid "$name")"; then
+    info "$name already running (PID $existing_pid)"
     return 0
   fi
-  nohup "$@" >"$PIDDIR/$name.log" 2>&1 &
-  echo $! >"$PIDDIR/$name.pid"
-  info "$name started (PID $!)"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$@" </dev/null >"$PIDDIR/$name.log" 2>&1
+  else
+    nohup "$@" </dev/null >"$PIDDIR/$name.log" 2>&1 &
+  fi
+  sleep 1
+  local pid
+  if ! pid="$(resolve_running_pid "$name")"; then
+    warn "$name failed to stay up; check $PIDDIR/$name.log"
+    tail -20 "$PIDDIR/$name.log" 2>/dev/null || true
+    rm -f "$PIDDIR/$name.pid"
+    return 1
+  fi
+  echo "$pid" >"$PIDDIR/$name.pid"
+  info "$name started (PID $pid)"
 }
 
 stop_service() {
   local name="$1"
   local pidfile="$PIDDIR/$name.pid"
-  if [ -f "$pidfile" ]; then
-    local pid
-    pid="$(cat "$pidfile")"
+  local pid
+  if pid="$(resolve_running_pid "$name")"; then
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
       info "$name stopped (PID $pid)"
@@ -97,32 +154,32 @@ stop_service() {
 show_status() {
   mkdir -p "$PIDDIR"
   echo ""
-  for svc in telegram-bridge cloudflared; do
-    if is_running "$svc"; then
-      echo -e "  ${GREEN}●${NC} $svc  (PID $(cat "$PIDDIR/$svc.pid"))"
+  for svc in slack-bridge whatsapp-bridge telegram-bridge cloudflared; do
+    local pid
+    if pid="$(resolve_running_pid "$svc")"; then
+      echo -e "  ${GREEN}●${NC} $svc  (PID $pid)"
     else
       echo -e "  ${RED}●${NC} $svc  (stopped)"
     fi
   done
   echo ""
-
-  if [ -f "$PIDDIR/cloudflared.log" ]; then
-    local url
-    url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$PIDDIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-    if [ -n "$url" ]; then
-      info "Public URL: $url"
-    fi
-  fi
 }
 
 do_stop() {
   mkdir -p "$PIDDIR"
-  stop_service cloudflared
+  stop_service slack-bridge
+  stop_service whatsapp-bridge
   stop_service telegram-bridge
+  stop_service cloudflared
   info "All services stopped."
 }
 
 do_start() {
+  if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_APP_TOKEN:-}" ]; then
+    warn "SLACK_BOT_TOKEN / SLACK_APP_TOKEN not set — Slack bridge will not start."
+    warn "Create a Slack app at https://api.slack.com/apps with Socket Mode enabled."
+  fi
+
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
     warn "TELEGRAM_BOT_TOKEN not set — Telegram bridge will not start."
     warn "Create a bot via @BotFather on Telegram and set the token."
@@ -145,11 +202,24 @@ do_start() {
   # Verify sandbox is running
   if command -v openshell >/dev/null 2>&1; then
     if ! openshell sandbox list 2>&1 | grep -q "Ready"; then
-      warn "No sandbox in Ready state. Telegram bridge may not work until sandbox is running."
+      warn "No sandbox in Ready state. Slack bridge may not work until sandbox is running."
     fi
   fi
 
   mkdir -p "$PIDDIR"
+
+  # Slack bridge (only if both tokens provided)
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_APP_TOKEN:-}" ]; then
+    # Use multi-user bridge if users.json exists with registered users
+    USERS_FILE="$HOME/.nemoclaw/users.json"
+    if [ -f "$USERS_FILE" ] && python3 -c "import json; d=json.load(open('$USERS_FILE')); exit(0 if len(d.get('users',{})) > 0 else 1)" 2>/dev/null; then
+      start_service slack-bridge \
+        node "$REPO_DIR/scripts/slack-bridge-multi.js"
+    else
+      SANDBOX_NAME="$SANDBOX_NAME" ALLOWED_USERS="${ALLOWED_USERS:-}" start_service slack-bridge \
+        node "$REPO_DIR/scripts/slack-bridge.js"
+    fi
+  fi
 
   # Telegram bridge (only if token provided)
   if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${NVIDIA_API_KEY:-}" ]; then
@@ -157,12 +227,22 @@ do_start() {
       node "$REPO_DIR/scripts/telegram-bridge.js"
   fi
 
-  # 3. cloudflared tunnel
+  # WhatsApp bridge (runs on host — WS can't go through sandbox proxy)
+  WA_AUTH_DIR="$REPO_DIR/persist/gateway/whatsapp-auth"
+  WA_FALLBACK="/tmp/wa-login/auth"
+  if [ -f "$WA_AUTH_DIR/creds.json" ] || [ -f "$WA_FALLBACK/creds.json" ]; then
+    start_service whatsapp-bridge \
+      node "$REPO_DIR/scripts/whatsapp-bridge-multi.js"
+  else
+    warn "WhatsApp not linked — bridge will not start. Run: cd /tmp/wa-login && node login.js"
+  fi
+
+  # cloudflared tunnel
   if command -v cloudflared >/dev/null 2>&1; then
     start_service cloudflared \
       cloudflared tunnel --url "http://localhost:$DASHBOARD_PORT"
   else
-    warn "cloudflared not found — no public URL. Install it separately if you need a public tunnel."
+    warn "cloudflared not found — no public URL. Install: brev-setup.sh or manually."
   fi
 
   # Wait for cloudflared to publish URL
@@ -184,19 +264,10 @@ do_start() {
   echo "  │  NemoClaw Services                                  │"
   echo "  │                                                     │"
 
-  local tunnel_url=""
-  if [ -f "$PIDDIR/cloudflared.log" ]; then
-    tunnel_url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$PIDDIR/cloudflared.log" 2>/dev/null | head -1 || true)"
-  fi
-
-  if [ -n "$tunnel_url" ]; then
-    printf "  │  Public URL:  %-40s│\n" "$tunnel_url"
-  fi
-
-  if is_running telegram-bridge; then
-    echo "  │  Telegram:    bridge running                        │"
+  if is_running slack-bridge; then
+    echo "  │  Slack:       bridge running                        │"
   else
-    echo "  │  Telegram:    not started (no token)                │"
+    echo "  │  Slack:       not started (no token)                │"
   fi
 
   echo "  │                                                     │"

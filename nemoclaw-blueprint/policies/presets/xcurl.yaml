@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: xcurl
+  description: "X/Twitter API access for xcurl skill"
+
+network_policies:
+  xcurl:
+    name: xcurl
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
+    endpoints:
+      - host: api.x.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+          - allow: { method: DELETE, path: "/**" }
+      - host: api.twitter.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }
+          - allow: { method: DELETE, path: "/**" }
+      - host: upload.twitter.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: POST, path: "/**" }

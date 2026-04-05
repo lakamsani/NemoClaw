@@ -72,7 +72,10 @@ network_policies:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
     binaries:
+      - { path: /usr/local/bin/node }
       - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
 
   nvidia:
     name: nvidia
@@ -94,7 +97,9 @@ network_policies:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
     binaries:
+      - { path: /usr/local/bin/node }
       - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
       - { path: /usr/local/bin/openclaw }
 
   github:
@@ -108,7 +113,11 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/bin/gh }
+      - { path: /usr/local/bin/gh }
+      - { path: /sandbox/.local/bin/gh }
       - { path: /usr/bin/git }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
 
   # ── OpenClaw "phone home" ────────────────────────────────────────────
   # Minimum viable set for OpenClaw to authenticate, discover plugins,
@@ -167,9 +176,12 @@ network_policies:
         port: 443
         access: full
     binaries:
+      - { path: /usr/local/bin/node }
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/local/bin/npm }
       - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
 
   # ── Messaging — pre-allowed for OpenClaw agent notifications ────
   # Restricted to node processes to prevent arbitrary data exfiltration

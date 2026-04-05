@@ -27,6 +27,39 @@ RUN (apt-get remove --purge -y gcc gcc-12 g++ g++-12 cpp cpp-12 make \
     && apt-get autoremove --purge -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Claude Code CLI (pin version for reproducible builds)
+RUN npm install -g @anthropic-ai/claude-code@2.1.81
+
+# Install GitHub CLI (gh)
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sL "https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_${ARCH}.tar.gz" \
+    | tar xz -C /tmp && cp /tmp/gh_*/bin/gh /usr/local/bin/gh && rm -rf /tmp/gh_*
+
+# Install gog CLI (Google OAuth helper for headless environments)
+RUN ARCH=$(dpkg --print-architecture) && \
+    GOG_ARCH=$([ "$ARCH" = "arm64" ] && echo "arm64" || echo "amd64") && \
+    curl -sL "https://github.com/steipete/gogcli/releases/download/v0.12.0/gogcli_0.12.0_linux_${GOG_ARCH}.tar.gz" \
+    | tar xz -C /tmp && cp /tmp/gog /usr/local/bin/gog && chmod +x /usr/local/bin/gog && rm -f /tmp/gog
+
+# Install xurl (X/Twitter API CLI)
+RUN ARCH=$(dpkg --print-architecture) && \
+    XURL_ARCH=$([ "$ARCH" = "arm64" ] && echo "arm64" || echo "x86_64") && \
+    curl -sL "https://github.com/xdevplatform/xurl/releases/download/v1.0.3/xurl_Linux_${XURL_ARCH}.tar.gz" \
+    | tar xz -C /tmp && cp /tmp/xurl /usr/local/bin/xurl && chmod +x /usr/local/bin/xurl && rm -f /tmp/xurl
+
+# Install JDK and Gradle (always use Gradle for Java projects, never Maven)
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends default-jdk-headless unzip \
+    && GRADLE_VERSION=8.13 \
+    && curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt \
+    && ln -sf "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
+    && rm -f /tmp/gradle.zip \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install PyYAML for blueprint runner
+RUN pip3 install --break-system-packages pyyaml
+
 # Copy built plugin and blueprint into the sandbox
 COPY --from=builder /opt/nemoclaw/dist/ /opt/nemoclaw/dist/
 COPY nemoclaw/openclaw.plugin.json /opt/nemoclaw/
@@ -54,7 +87,6 @@ ARG CHAT_UI_URL=http://127.0.0.1:18789
 ARG NEMOCLAW_INFERENCE_BASE_URL=https://inference.local/v1
 ARG NEMOCLAW_INFERENCE_API=openai-completions
 ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=
-ARG NEMOCLAW_WEB_CONFIG_B64=e30=
 # Set to "1" to disable device-pairing auth (development/headless only).
 # Default: "0" (device auth enabled — secure by default).
 ARG NEMOCLAW_DISABLE_DEVICE_AUTH=0
@@ -72,15 +104,19 @@ ENV NEMOCLAW_MODEL=${NEMOCLAW_MODEL} \
     NEMOCLAW_INFERENCE_BASE_URL=${NEMOCLAW_INFERENCE_BASE_URL} \
     NEMOCLAW_INFERENCE_API=${NEMOCLAW_INFERENCE_API} \
     NEMOCLAW_INFERENCE_COMPAT_B64=${NEMOCLAW_INFERENCE_COMPAT_B64} \
-    NEMOCLAW_WEB_CONFIG_B64=${NEMOCLAW_WEB_CONFIG_B64} \
     NEMOCLAW_DISABLE_DEVICE_AUTH=${NEMOCLAW_DISABLE_DEVICE_AUTH}
 
 WORKDIR /sandbox
 USER sandbox
 
+# Pre-create OpenClaw directories
+RUN mkdir -p /sandbox/.openclaw/agents/main/agent \
+    && chmod 700 /sandbox/.openclaw
+
 # Write the COMPLETE openclaw.json including gateway config and auth token.
+# Claude Sonnet 4.6 as default, nvidia as fallback.
+# ANTHROPIC_API_KEY is injected at runtime from Claude credentials.
 # This file is immutable at runtime (Landlock read-only on /sandbox/.openclaw).
-# No runtime writes to openclaw.json are needed or possible.
 # Build args (NEMOCLAW_MODEL, CHAT_UI_URL) customize per deployment.
 # Auth token is generated per build so each image has a unique token.
 RUN python3 -c "\
@@ -93,7 +129,6 @@ primary_model_ref = os.environ['NEMOCLAW_PRIMARY_MODEL_REF']; \
 inference_base_url = os.environ['NEMOCLAW_INFERENCE_BASE_URL']; \
 inference_api = os.environ['NEMOCLAW_INFERENCE_API']; \
 inference_compat = json.loads(base64.b64decode(os.environ['NEMOCLAW_INFERENCE_COMPAT_B64']).decode('utf-8')); \
-web_config = json.loads(base64.b64decode(os.environ.get('NEMOCLAW_WEB_CONFIG_B64', 'e30=') or 'e30=').decode('utf-8')); \
 parsed = urlparse(chat_ui_url); \
 chat_origin = f'{parsed.scheme}://{parsed.netloc}' if parsed.scheme and parsed.netloc else 'http://127.0.0.1:18789'; \
 origins = ['http://127.0.0.1:18789']; \
@@ -109,8 +144,15 @@ providers = { \
     } \
 }; \
 config = { \
-    'agents': {'defaults': {'model': {'primary': primary_model_ref}}}, \
-    'models': {'mode': 'merge', 'providers': providers}, \
+    'agents': {'defaults': {'model': {'primary': 'anthropic/claude-sonnet-4-6'}}}, \
+    'models': {'mode': 'merge', 'providers': {**providers, \
+        'anthropic': { \
+            'baseUrl': 'https://api.anthropic.com/v1', \
+            'apiKey': 'injected-at-runtime', \
+            'api': 'anthropic-messages', \
+            'models': [{'id': 'claude-sonnet-4-6', 'name': 'Claude Sonnet 4.6', 'reasoning': False, 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}, 'contextWindow': 200000, 'maxTokens': 64000}] \
+        } \
+    }}, \
     'channels': {'defaults': {'configWrites': False}}, \
     'gateway': { \
         'mode': 'local', \
@@ -123,20 +165,6 @@ config = { \
         'auth': {'token': secrets.token_hex(32)} \
     } \
 }; \
-config.update({ \
-    'tools': { \
-        'web': { \
-            'search': { \
-                'enabled': True, \
-                'provider': 'brave', \
-                **({'apiKey': web_config.get('apiKey', '')} if web_config.get('apiKey', '') else {}) \
-            }, \
-            'fetch': { \
-                'enabled': bool(web_config.get('fetchEnabled', True)) \
-            } \
-        } \
-    } \
-} if web_config.get('provider') == 'brave' else {}); \
 path = os.path.expanduser('~/.openclaw/openclaw.json'); \
 json.dump(config, open(path, 'w'), indent=2); \
 os.chmod(path, 0o600)"

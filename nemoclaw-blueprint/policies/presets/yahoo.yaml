@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: yahoo
+  description: "Yahoo Mail IMAP/SMTP access"
+
+network_policies:
+  yahoo:
+    name: yahoo
+    endpoints:
+      - host: imap.mail.yahoo.com
+        port: 993
+        access: full
+      - host: smtp.mail.yahoo.com
+        port: 465
+        access: full
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/claude }
+      - { path: /sandbox/.local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
