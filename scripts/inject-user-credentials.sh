@@ -65,13 +65,17 @@ ssh_cmd() {
 
 patch_claude_runtime() {
   local anthropic_key="${1:-}"
+  local token_json="''"
+  if [ -n "$anthropic_key" ]; then
+    token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$anthropic_key")"
+  fi
   local script
-  script=$(cat <<'PYSCRIPT'
-import base64, json, os
+  script=$(cat <<PYSCRIPT
+import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
 if not os.path.exists(path):
     raise SystemExit(0)
-key = base64.b64decode(os.environ.get('ANTHROPIC_KEY_B64', '')).decode() if os.environ.get('ANTHROPIC_KEY_B64') else ''
+key = ${token_json}
 cfg = json.load(open(path))
 providers = cfg.setdefault('models', {}).setdefault('providers', {})
 anthropic = providers.get('anthropic')
@@ -83,10 +87,10 @@ os.chmod(path, 0o600)
 PYSCRIPT
 )
   local b64_script
-  local b64_key
   b64_script="$(printf '%s' "$script" | base64 -w0)"
-  b64_key="$(printf '%s' "$anthropic_key" | base64 -w0)"
-  ssh_cmd "ANTHROPIC_KEY_B64='$b64_key' base64 -d <<< '$b64_script' | python3" 2>/dev/null
+  if ! printf '%s' "$b64_script" | ssh_cmd 'base64 -d | python3' 2>/dev/null; then
+    warn "Skipping runtime openclaw.json patch; sandbox cannot rewrite ~/.openclaw/openclaw.json"
+  fi
 }
 
 # Ensure target directories exist

@@ -31,6 +31,8 @@ describe("slack-bridge-multi helpers", () => {
     expect(bridge.isShowUserCommand("!show user U123ABC")).toBe(true);
     expect(bridge.isAddClawCommand("!add-claw U123ABC Jane jane-claw janedoe")).toBe(true);
     expect(bridge.isAddClawCommand("!add claw U123ABC Jane jane-claw janedoe")).toBe(true);
+    expect(bridge.isPurgeClawCommand("!purge-claw jane-claw")).toBe(true);
+    expect(bridge.isPurgeClawCommand("!purge claw jane-claw")).toBe(true);
     expect(bridge.isDeleteClawCommand("!delete-claw jane-claw")).toBe(true);
     expect(bridge.isDeleteClawCommand("!delete claw jane-claw")).toBe(true);
     expect(bridge.isConfirmDeleteClawCommand("!confirm-delete-claw jane-claw")).toBe(true);
@@ -40,8 +42,19 @@ describe("slack-bridge-multi helpers", () => {
   it("canonicalizes spaced admin commands and detects admin-like typos", () => {
     expect(bridge.canonicalizeAdminCommand("!show claws ready")).toBe("!show-claws ready");
     expect(bridge.canonicalizeAdminCommand("!confirm delete claw alice-claw")).toBe("!confirm-delete-claw alice-claw");
+    expect(bridge.canonicalizeAdminCommand("!purge claw alice-claw")).toBe("!purge-claw alice-claw");
     expect(bridge.looksLikeAdminCommand("!show clawz")).toBe(true);
     expect(bridge.looksLikeAdminCommand("hello")).toBe(false);
+  });
+
+  it("recognizes known bang commands and rejects unknown ones", () => {
+    expect(bridge.isKnownBangCommand("!show-claws")).toBe(true);
+    expect(bridge.isKnownBangCommand("!purge-claw alice-claw")).toBe(true);
+    expect(bridge.isKnownBangCommand("!setup help")).toBe(true);
+    expect(bridge.isKnownBangCommand("!yahoo inbox")).toBe(true);
+    expect(bridge.isKnownBangCommand("!wa inbox")).toBe(true);
+    expect(bridge.isKnownBangCommand("!purgee-claw alice-claw")).toBe(false);
+    expect(bridge.isKnownBangCommand("!some-random-command")).toBe(false);
   });
 
   it("builds actionable auth recovery guidance for per-user Claude OAuth", () => {
@@ -85,6 +98,63 @@ describe("slack-bridge-multi helpers", () => {
     expect(cmd).toContain("NEMOCLAW_SKIP_CLAUDE_AUTH=1");
     expect(cmd).toContain("export OPENAI_API_KEY=");
     expect(cmd).not.toContain("PYMODEL");
+  });
+
+  it("injects no-background execution rules into agent commands", () => {
+    const cmd = bridge.buildAgentCommand("open a PR after tests pass", "abc", {
+      slackUserId: "U1",
+      slackDisplayName: "Alice",
+      roles: ["user"],
+    });
+    expect(cmd).toContain("Do not start background Claude Code sessions");
+    expect(cmd).toContain("Only report success after the requested work, tests, and PR creation are actually complete.");
+    expect(cmd).toContain("User request: open a PR after tests pass");
+  });
+
+  it("detects coding tasks that should go straight to Claude Code", () => {
+    expect(bridge.shouldUseDirectClaudeCode("migrate fare-finder git repo from go to java, run tests and send a PR")).toBe(true);
+    expect(bridge.shouldUseDirectClaudeCode("fix the build in this repository and open a PR")).toBe(true);
+    expect(bridge.shouldUseDirectClaudeCode("get 3 most active EPICs from BILLING")).toBe(false);
+    expect(bridge.shouldUseDirectClaudeCode("list my personal tasks on google calendar")).toBe(false);
+  });
+
+  it("tells direct Claude Code runs to resolve repos generically with gh", () => {
+    const cmd = bridge.buildClaudeCodeCommand("migrate fare-finder git repo from go to java", {
+      slackUserId: "U1",
+      slackDisplayName: "Alice",
+      githubUser: "alicehub",
+      roles: ["user"],
+    });
+    expect(cmd).toContain("If the prompt names a repo, first try an exact lookup");
+    expect(cmd).toContain("GitHub user: alicehub");
+    expect(cmd).toContain("export NEMOCLAW_GITHUB_USER='alicehub'");
+  });
+
+  it("extracts Freshrelease project keys generically", () => {
+    expect(bridge.extractFreshreleaseProjects("get 5 active epics from BILLING, SEARCH, FRESHID")).toEqual(["BILLING", "SEARCH", "FRESHID"]);
+    expect(bridge.extractFreshreleaseProjects("show details for COREAPP-1234")).toEqual(["COREAPP"]);
+  });
+
+  it("parses generic Google requests", () => {
+    expect(bridge.parseGoogleRequest("list my personal tasks on google calendar")).toEqual({
+      kind: "tasks",
+      limit: 5,
+      status: "open",
+      listQuery: "",
+      preferPersonal: true,
+    });
+    expect(bridge.parseGoogleRequest("get from Freshworks tasks")).toEqual({
+      kind: "tasks",
+      limit: 5,
+      status: "open",
+      listQuery: "freshworks",
+      preferPersonal: false,
+    });
+    expect(bridge.parseGoogleRequest("show 10 google calendar events this week")).toEqual({
+      kind: "calendar",
+      limit: 10,
+      range: "week",
+    });
   });
 
   it("builds admin users from roles and allowlist-only entries", () => {
@@ -148,6 +218,14 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
     const configured = bridge.listConfiguredCredentials({ credentialsDir });
 
     expect(configured).toEqual(["GitHub", "Google (gogcli)", "Freshrelease"]);
+  });
+
+  it("expires and drops stale pending runs by age", () => {
+    const now = 1_000_000;
+    expect(bridge.shouldExpirePendingRun({ startedAt: now - (21 * 60 * 1000) }, now)).toBe(true);
+    expect(bridge.shouldExpirePendingRun({ startedAt: now - (5 * 60 * 1000) }, now)).toBe(false);
+    expect(bridge.shouldDropPendingRun({ startedAt: now - (7 * 60 * 60 * 1000) }, now)).toBe(true);
+    expect(bridge.shouldDropPendingRun({ startedAt: now - (30 * 60 * 1000) }, now)).toBe(false);
   });
 
   it("formats claw inventory details", () => {
@@ -263,5 +341,101 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
   it("builds filtered show-claws payload", () => {
     const payload = bridge.buildShowClawsPayload("!show-claws ready sort=status");
     expect(payload).toHaveProperty("text");
+  });
+
+  it("detects Freshrelease epic shortcut requests", () => {
+    expect(bridge.parseFreshreleaseEpicRequest("get 3 most active EPICs from BILLING, SEARCH, FRESHID")).toEqual({
+      projects: ["BILLING", "SEARCH", "FRESHID"],
+      limit: 3,
+      statusQuery: "",
+    });
+    expect(bridge.parseFreshreleaseEpicRequest("show top 5 epics for billing")).toEqual({
+      projects: ["BILLING"],
+      limit: 5,
+      statusQuery: "",
+    });
+    expect(bridge.parseFreshreleaseEpicRequest("list stories in BILLING")).toBeNull();
+  });
+
+  it("detects Freshrelease child-story and issue-detail requests", () => {
+    expect(bridge.parseFreshreleaseChildrenRequest("get all stories under BILLING-10505")).toEqual({
+      parentKey: "BILLING-10505",
+      statusQuery: "",
+    });
+    expect(bridge.parseFreshreleaseChildrenRequest("list issues under SEARCH-4091")).toEqual({
+      parentKey: "SEARCH-4091",
+      statusQuery: "",
+    });
+    expect(bridge.parseFreshreleaseIssueDetailRequest("get full details for BILLING-10505")).toEqual({
+      issueKey: "BILLING-10505",
+    });
+    expect(bridge.parseFreshreleaseIssueDetailRequest("details for SEARCH-4091")).toEqual({
+      issueKey: "SEARCH-4091",
+    });
+  });
+
+  it("detects natural-language Freshrelease state filters", () => {
+    expect(bridge.parseFreshreleaseStatusQuery("get all open stories under BILLING-10505")).toBe("open");
+    expect(bridge.parseFreshreleaseStatusQuery("show ready to test stories under BILLING-10505")).toBe("ready to test");
+    expect(bridge.parseFreshreleaseEpicRequest("get 3 open epics from BILLING")).toEqual({
+      projects: ["BILLING"],
+      limit: 3,
+      statusQuery: "open",
+    });
+  });
+
+  it("recognizes retry commands", () => {
+    expect(bridge.isRetryCommand("retry")).toBe(true);
+    expect(bridge.isRetryCommand("try again")).toBe(true);
+    expect(bridge.isRetryCommand("retry that")).toBe(true);
+    expect(bridge.isRetryCommand("retry my last git repos query")).toBe(true);
+    expect(bridge.isRetryCommand("retry last request")).toBe(true);
+    expect(bridge.isRetryCommand("retry latest freshrelease query")).toBe(false);
+  });
+
+  it("redacts sensitive values from responses", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-freshrelease-redact-"));
+    const credentialsDir = path.join(tempRoot, "credentials");
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    fs.writeFileSync(path.join(credentialsDir, "freshrelease-api-key.txt"), "secret-token-123");
+    const text = bridge.redactSensitiveText("API key: secret-token-123\nAuthorization: Token secret-token-123", {
+      slackUserId: "U1",
+      credentialsDir,
+    });
+    expect(text).not.toContain("secret-token-123");
+    expect(text).toContain("[REDACTED]");
+  });
+
+  it("records and reuses the last non-retry user request", () => {
+    bridge.recordLastUserRequest("U-last", "list my git repos changed this month");
+    bridge.recordLastUserRequest("U-last", "retry");
+    expect(bridge.getRecordedLastUserRequest("U-last")).toBe("list my git repos changed this month");
+  });
+
+  it("detects Freshrelease credentials from the user credential directory", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-freshrelease-"));
+    const credentialsDir = path.join(tempRoot, "credentials");
+    fs.mkdirSync(credentialsDir, { recursive: true });
+    expect(bridge.hasFreshreleaseCredentials({ slackUserId: "U1", credentialsDir })).toBe(false);
+    fs.writeFileSync(path.join(credentialsDir, "freshrelease-api-key.txt"), "token");
+    expect(bridge.hasFreshreleaseCredentials({ slackUserId: "U1", credentialsDir })).toBe(true);
+  });
+
+  it("collapses multi-project Freshrelease output into one markdown table", () => {
+    const merged = bridge.collapseFreshreleaseTables(`## BILLING
+Epic type: Epic (epic, id=11)
+| Key | Title | Assigned User | Current State | Created Date | Targeted Date | Updated |
+|---|---|---|---|---|---|---|
+| BILLING-1 | Billing Epic | Alice | Open | 2026-01-01 | 2026-02-01 | 2026-01-05 |
+
+## SEARCH
+Epic type: Epic (epic, id=11)
+| Key | Title | Assigned User | Current State | Created Date | Targeted Date | Updated |
+|---|---|---|---|---|---|---|
+| SEARCH-1 | Search Epic | Bob | In Progress | 2026-01-03 | 2026-02-04 | 2026-01-06 |
+`);
+    expect(merged).toContain("| Project | Epic Type | Key | Title | Assigned User | Current State | Created Date | Targeted Date | Updated |");
+    expect(merged).toContain("| BILLING | Epic (epic, id=11) | BILLING-1 | Billing Epic | Alice | Open | 2026-01-01 | 2026-02-01 | 2026-01-05 |");
+    expect(merged).toContain("| SEARCH | Epic (epic, id=11) | SEARCH-1 | Search Epic | Bob | In Progress | 2026-01-03 | 2026-02-04 | 2026-01-06 |");
   });
 });

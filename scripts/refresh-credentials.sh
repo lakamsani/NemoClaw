@@ -112,23 +112,26 @@ if [ -n "$CLAUDE_CREDS" ] && [ -z "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
 fi
 
 # Write .credentials.json from the long-lived token (claude --print reads this, not .env)
+# Uses base64 to avoid shell-escaping issues with tokens containing special chars.
 if [ -n "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
-  ssh_cmd "python3 -c \"
+  echo -n "$DESIRED_CLAUDE_CODE_TOKEN" | base64 -w0 | ssh_cmd 'base64 -d > /tmp/.nc-token && python3 << "PYEOF"
 import json, os
+token = open("/tmp/.nc-token").read().strip()
 creds = {
-    'claudeAiOauth': {
-        'accessToken': '${DESIRED_CLAUDE_CODE_TOKEN}',
-        'refreshToken': '',
-        'expiresAt': 9999999999999,
-        'scopes': ['user:inference', 'user:mcp_servers', 'user:profile', 'user:sessions:claude_code'],
-        'subscriptionType': 'team',
-        'rateLimitTier': 'default_claude_max_5x'
+    "claudeAiOauth": {
+        "accessToken": token,
+        "refreshToken": "",
+        "expiresAt": 9999999999999,
+        "scopes": ["user:inference", "user:mcp_servers", "user:profile", "user:sessions:claude_code"],
+        "subscriptionType": "team",
+        "rateLimitTier": "default_claude_max_5x"
     }
 }
-os.makedirs('/sandbox/.claude', exist_ok=True)
-json.dump(creds, open('/sandbox/.claude/.credentials.json', 'w'), indent=2)
-os.chmod('/sandbox/.claude/.credentials.json', 0o600)
-\"" 2>/dev/null
+os.makedirs("/sandbox/.claude", exist_ok=True)
+json.dump(creds, open("/sandbox/.claude/.credentials.json", "w"), indent=2)
+os.chmod("/sandbox/.claude/.credentials.json", 0o600)
+os.remove("/tmp/.nc-token")
+PYEOF'
 fi
 
 # Re-inject Anthropic API key if stored separately (per-user)
@@ -154,20 +157,34 @@ except Exception:
 GATEWAY_RESTART_NEEDED=false
 
 if [ -n "$DESIRED_ANTHROPIC_KEY" ] && [ "$CURRENT_ANTHROPIC_KEY" != "$DESIRED_ANTHROPIC_KEY" ]; then
-  ssh_cmd "python3 -c \"
+  # Use base64 to safely transfer tokens through SSH without shell-escaping corruption.
+  echo -n "$DESIRED_ANTHROPIC_KEY" | base64 -w0 | ssh_cmd 'base64 -d > /tmp/.nc-token && python3 << "PYEOF"
 import json, os
-path = os.path.expanduser('~/.openclaw/openclaw.json')
+token = open("/tmp/.nc-token").read().strip()
+path = os.path.expanduser("~/.openclaw/openclaw.json")
 cfg = json.load(open(path))
-p = cfg.get('models',{}).get('providers',{}).get('anthropic',{})
+p = cfg.get("models",{}).get("providers",{}).get("anthropic",{})
 if p:
-    p['apiKey'] = '${DESIRED_ANTHROPIC_KEY}'
-cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
-json.dump(cfg, open(path, 'w'), indent=2)
+    p["apiKey"] = token
+cfg.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})["primary"] = "anthropic/claude-sonnet-4-6"
+json.dump(cfg, open(path, "w"), indent=2)
 os.chmod(path, 0o600)
-\"" 2>/dev/null
 
-  # OpenClaw reads env vars with higher priority than models.json, so keep both in sync.
-  ssh_cmd "grep -q ANTHROPIC_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${DESIRED_ANTHROPIC_KEY}|' /sandbox/.env || echo 'ANTHROPIC_API_KEY=${DESIRED_ANTHROPIC_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
+# OpenClaw reads env vars with higher priority than models.json, so keep both in sync.
+env_path = "/sandbox/.env"
+lines = open(env_path).readlines() if os.path.exists(env_path) else []
+found = False
+for i, line in enumerate(lines):
+    if line.startswith("ANTHROPIC_API_KEY="):
+        lines[i] = f"ANTHROPIC_API_KEY={token}\n"
+        found = True
+        break
+if not found:
+    lines.append(f"ANTHROPIC_API_KEY={token}\n")
+open(env_path, "w").writelines(lines)
+os.chmod(env_path, 0o600)
+os.remove("/tmp/.nc-token")
+PYEOF'
   GATEWAY_RESTART_NEEDED=true
 fi
 
@@ -193,20 +210,38 @@ os.chmod(path, 0o600)
 fi
 
 if [ -n "$DESIRED_CLAUDE_CODE_TOKEN" ] && [ "$CURRENT_CLAUDE_CODE_TOKEN" != "$DESIRED_CLAUDE_CODE_TOKEN" ]; then
-  ssh_cmd "grep -q CLAUDE_CODE_OAUTH_TOKEN /sandbox/.env 2>/dev/null && sed -i 's|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${DESIRED_CLAUDE_CODE_TOKEN}|' /sandbox/.env || echo 'CLAUDE_CODE_OAUTH_TOKEN=${DESIRED_CLAUDE_CODE_TOKEN}' >> /sandbox/.env; chmod 600 /sandbox/.env" 2>/dev/null
+  echo -n "$DESIRED_CLAUDE_CODE_TOKEN" | base64 -w0 | ssh_cmd 'base64 -d > /tmp/.nc-token && python3 << "PYEOF"
+import os
+token = open("/tmp/.nc-token").read().strip()
+env_path = "/sandbox/.env"
+lines = open(env_path).readlines() if os.path.exists(env_path) else []
+found = False
+for i, line in enumerate(lines):
+    if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
+        lines[i] = f"CLAUDE_CODE_OAUTH_TOKEN={token}\n"
+        found = True
+        break
+if not found:
+    lines.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}\n")
+open(env_path, "w").writelines(lines)
+os.chmod(env_path, 0o600)
+os.remove("/tmp/.nc-token")
+PYEOF'
 fi
 
 if [ "$CURRENT_GATEWAY_TOKEN" != "$GATEWAY_TOKEN" ]; then
-  ssh_cmd "python3 -c \"
+  echo -n "$GATEWAY_TOKEN" | base64 -w0 | ssh_cmd 'base64 -d > /tmp/.nc-token && python3 << "PYEOF"
 import json, os
-path = os.path.expanduser('~/.openclaw/openclaw.json')
+token = open("/tmp/.nc-token").read().strip()
+path = os.path.expanduser("~/.openclaw/openclaw.json")
 cfg = json.load(open(path))
-gw = cfg.setdefault('gateway', {})
-gw['auth'] = {'mode': 'token', 'token': '${GATEWAY_TOKEN}'}
-gw['controlUi'] = {'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True, 'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']}
-json.dump(cfg, open(path, 'w'), indent=2)
+gw = cfg.setdefault("gateway", {})
+gw["auth"] = {"mode": "token", "token": token}
+gw["controlUi"] = {"allowInsecureAuth": True, "dangerouslyDisableDeviceAuth": True, "allowedOrigins": ["http://127.0.0.1:18789", "http://localhost:18789"]}
+json.dump(cfg, open(path, "w"), indent=2)
 os.chmod(path, 0o600)
-\"" 2>/dev/null
+os.remove("/tmp/.nc-token")
+PYEOF'
   GATEWAY_RESTART_NEEDED=true
 fi
 
@@ -222,6 +257,37 @@ if [ -d "$IDENTITY_DIR" ]; then
   for f in "$IDENTITY_DIR"/*.json; do
     [ -f "$f" ] && base64 "$f" | ssh_cmd "base64 -d > /sandbox/.openclaw/identity/$(basename "$f") && chmod 600 /sandbox/.openclaw/identity/$(basename "$f")"
   done
+fi
+
+# Always verify the token stored in openclaw.json matches what we expect.
+# The gateway caches apiKey in memory — if the on-disk value is empty or stale,
+# the gateway is serving a bad token and must be restarted.
+if [ -n "$DESIRED_ANTHROPIC_KEY" ]; then
+  ONDISK_KEY="$(ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+try:
+    cfg = json.load(open(path))
+    print(cfg.get('models',{}).get('providers',{}).get('anthropic',{}).get('apiKey',''))
+except Exception:
+    print('')
+\"" 2>/dev/null || true)"
+  if [ -z "$ONDISK_KEY" ] || [ "$ONDISK_KEY" != "$DESIRED_ANTHROPIC_KEY" ]; then
+    echo "[refresh] Token mismatch in openclaw.json for $SANDBOX — forcing update + restart ($(date))"
+    echo -n "$DESIRED_ANTHROPIC_KEY" | base64 -w0 | ssh_cmd 'base64 -d > /tmp/.nc-token && python3 << "PYEOF"
+import json, os
+token = open("/tmp/.nc-token").read().strip()
+path = os.path.expanduser("~/.openclaw/openclaw.json")
+cfg = json.load(open(path))
+p = cfg.get("models",{}).get("providers",{}).get("anthropic",{})
+if p:
+    p["apiKey"] = token
+json.dump(cfg, open(path, "w"), indent=2)
+os.chmod(path, 0o600)
+os.remove("/tmp/.nc-token")
+PYEOF'
+    GATEWAY_RESTART_NEEDED=true
+  fi
 fi
 
 if ! ssh_cmd 'export HOME=/sandbox; openclaw gateway call health > /dev/null 2>&1' 2>/dev/null; then

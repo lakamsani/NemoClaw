@@ -23,6 +23,55 @@ if [ -f "$REPO_DIR/.env" ]; then
   set -a; . "$REPO_DIR/.env"; set +a
 fi
 
+RUNTIME_CONFIG="$REPO_DIR/config/multi-user/runtime.json"
+read_runtime_value() {
+  local expr="${1:?json expr required}"
+  python3 - "$RUNTIME_CONFIG" "$expr" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    print("")
+    raise SystemExit(0)
+value = data
+for part in expr.split("."):
+    if not part:
+        continue
+    if isinstance(value, dict):
+        value = value.get(part)
+    else:
+        value = None
+        break
+print("" if value is None else value)
+PY
+}
+
+READY_TIMEOUT_MS="${READY_TIMEOUT_MS:-$(read_runtime_value sandbox.readyTimeoutMs)}"
+READY_POLL_MS="${READY_POLL_MS:-$(read_runtime_value sandbox.readyPollMs)}"
+INJECT_TIMEOUT_MS="${INJECT_TIMEOUT_MS:-$(read_runtime_value reconcile.injectTimeoutMs)}"
+DEVTOOLS_TIMEOUT_SECONDS="${DEVTOOLS_TIMEOUT_SECONDS:-$(read_runtime_value resilience.devtoolsTimeoutSeconds)}"
+READY_TIMEOUT_MS="${READY_TIMEOUT_MS:-180000}"
+READY_POLL_MS="${READY_POLL_MS:-5000}"
+INJECT_TIMEOUT_MS="${INJECT_TIMEOUT_MS:-120000}"
+DEVTOOLS_TIMEOUT_SECONDS="${DEVTOOLS_TIMEOUT_SECONDS:-90}"
+READY_TIMEOUT_SECONDS=$((READY_TIMEOUT_MS / 1000))
+READY_POLL_SECONDS=$((READY_POLL_MS / 1000))
+INJECT_TIMEOUT_SECONDS=$((INJECT_TIMEOUT_MS / 1000))
+[ "$READY_POLL_SECONDS" -lt 1 ] && READY_POLL_SECONDS=1
+[ "$READY_TIMEOUT_SECONDS" -lt 1 ] && READY_TIMEOUT_SECONDS=180
+[ "$INJECT_TIMEOUT_SECONDS" -lt 1 ] && INJECT_TIMEOUT_SECONDS=120
+
+run_with_timeout() {
+  local seconds="${1:?timeout required}"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${seconds}s" "$@"
+  else
+    "$@"
+  fi
+}
+
 SANDBOX="${NEMOCLAW_SANDBOX:-veyonce-claw}"
 CRED_DIR=""
 GITHUB_USER=""
@@ -87,16 +136,17 @@ fail()  { echo -e "${RED}[resilience]${NC} $1"; exit 1; }
 # ── Step 1: Wait for sandbox to be Ready ─────────────────────────
 info "Waiting for sandbox '$SANDBOX' to be Ready..."
 READY=false
-for i in $(seq 1 36); do
+READY_ATTEMPTS=$(( (READY_TIMEOUT_SECONDS + READY_POLL_SECONDS - 1) / READY_POLL_SECONDS ))
+for i in $(seq 1 "$READY_ATTEMPTS"); do
   if openshell sandbox list 2>&1 | grep -q "${SANDBOX}.*Ready"; then
     READY=true
     break
   fi
-  sleep 5
+  sleep "$READY_POLL_SECONDS"
 done
 
 if [ "$READY" != "true" ]; then
-  fail "Sandbox '$SANDBOX' not in Ready state after 3 minutes. Is it created?"
+  fail "Sandbox '$SANDBOX' not in Ready state after ${READY_TIMEOUT_SECONDS}s. Is it created?"
 fi
 info "Sandbox '$SANDBOX' is Ready"
 
@@ -125,7 +175,7 @@ openshell policy set --policy /tmp/nemoclaw-merged-policy.yaml "$SANDBOX" 2>&1 |
 info "Network policy applied"
 
 # ── Step 3b: Install dev tools (JDK + Gradle) if missing ────────
-docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- sh -c '
+run_with_timeout "$DEVTOOLS_TIMEOUT_SECONDS" docker exec openshell-cluster-nemoclaw kubectl exec -n openshell "$SANDBOX" -- sh -c '
   if ! command -v gradle >/dev/null 2>&1; then
     apt-get update -qq 2>/dev/null
     apt-get install -y -qq default-jdk-headless unzip 2>/dev/null
@@ -145,7 +195,7 @@ if [ -n "$CRED_DIR" ]; then
   [ -n "$GITHUB_USER" ] && GITHUB_FLAG="--github-user $GITHUB_USER"
   SLACK_FLAG=""
   [ -n "$SLACK_USER_ID" ] && SLACK_FLAG="--slack-user-id $SLACK_USER_ID"
-  "$SCRIPT_DIR/inject-user-credentials.sh" "$SANDBOX" "$CRED_DIR" $GITHUB_FLAG $SLACK_FLAG
+  run_with_timeout "$INJECT_TIMEOUT_SECONDS" "$SCRIPT_DIR/inject-user-credentials.sh" "$SANDBOX" "$CRED_DIR" $GITHUB_FLAG $SLACK_FLAG
   info "Per-user credentials injected via inject-user-credentials.sh"
 
   # Extract ANTHROPIC_API_KEY for openclaw config from per-user credentials

@@ -44,6 +44,25 @@ const nim = require("./lib/nim");
 const policies = require("./lib/policies");
 const { parseGatewayInference } = require("./lib/inference-config");
 const { getVersion } = require("./lib/version");
+const {
+  exportMultiUserState,
+  importMultiUserState,
+  inspectMultiUserState,
+  restoreAllUsersFromBundle,
+  restoreUserFromBundle,
+} = require("./lib/migration");
+const {
+  formatReconcilePlan,
+  reconcileAll,
+  reconcileUser,
+} = require("./lib/reconcile");
+const {
+  bootstrapAll,
+  bootstrapUser,
+  formatBootstrapPlan,
+} = require("./lib/bootstrap");
+const { copySharedWorkspaceFiles, loadRuntimeConfig } = require("./lib/runtime-config");
+const { createSandboxWithRecovery } = require("./lib/sandbox-lifecycle");
 const onboardSession = require("./lib/onboard-session");
 const { parseLiveSandboxNames } = require("./lib/runtime-recovery");
 const { NOTICE_ACCEPT_ENV, NOTICE_ACCEPT_FLAG } = require("./lib/usage-notice");
@@ -70,6 +89,15 @@ const GLOBAL_COMMANDS = new Set([
   "user-disable",
   "user-grant-admin",
   "user-revoke-admin",
+  "migration-export",
+  "migration-import",
+  "migration-inspect",
+  "migration-restore-user",
+  "migration-restore-all",
+  "bootstrap-user",
+  "bootstrap-all",
+  "reconcile-user",
+  "reconcile-all",
   "help",
   "--help",
   "-h",
@@ -979,6 +1007,29 @@ async function listSandboxes() {
 
 async function userAdd(args = []) {
   const { prompt: askPrompt } = require("./lib/credentials");
+  const cleanupProvisioningArtifacts = (slackUserId, sandboxName, persistBase, createdUser, createdSandboxRegistryEntry) => {
+    if (createdSandboxRegistryEntry) {
+      try {
+        registry.removeSandbox(sandboxName);
+      } catch {
+        /* ignored */
+      }
+    }
+    if (createdUser) {
+      try {
+        userReg.removeUser(slackUserId);
+      } catch {
+        /* ignored */
+      }
+    }
+    if (persistBase) {
+      try {
+        fs.rmSync(path.join(ROOT, persistBase), { recursive: true, force: true });
+      } catch {
+        /* ignored */
+      }
+    }
+  };
   const applyDefaultPolicies = async (sandboxNameForPolicies) => {
     const defaultPresets = ["npm", "pypi", "slack"];
     const allPresets = policies.listPresets();
@@ -1067,6 +1118,11 @@ async function userAdd(args = []) {
   }
 
   const githubUser = nonInteractive ? (argGithubUser || "") : await askPrompt("  GitHub username (optional, press Enter to skip): ");
+  const persistBase = `persist/users/${slackUserId}`;
+  const credDir = `${persistBase}/credentials`;
+  const workspaceDir = `${persistBase}/workspace`;
+  let createdUser = false;
+  let createdSandboxRegistryEntry = false;
 
   // Check if sandbox exists or needs to be created
   let sbExists = registry.getSandbox(sandboxName);
@@ -1080,77 +1136,24 @@ async function userAdd(args = []) {
       gpuEnabled: false,
       policies: [],
     });
+    createdSandboxRegistryEntry = true;
     sbExists = registry.getSandbox(sandboxName);
     console.log(`  Found existing live sandbox '${sandboxName}'. Adopting it into the local registry.`);
     await applyDefaultPolicies(sandboxName);
   }
 
-  if (!sbExists) {
-    const create = nonInteractive ? "y" : await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
-    if (create.toLowerCase() !== "n") {
-      console.log(`  Creating sandbox '${sandboxName}' (this may take a few minutes on first run)...`);
-
-      // Stage build context (same as onboard flow)
-      const { mkdtempSync } = require("fs");
-      const buildCtx = mkdtempSync(path.join(os.tmpdir(), "nemoclaw-build-"));
-      fs.copyFileSync(path.join(ROOT, "Dockerfile"), path.join(buildCtx, "Dockerfile"));
-      execFileSync("cp", ["-r", path.join(ROOT, "nemoclaw"), path.join(buildCtx, "nemoclaw")], { stdio: "inherit" });
-      execFileSync("cp", ["-r", path.join(ROOT, "nemoclaw-blueprint"), path.join(buildCtx, "nemoclaw-blueprint")], { stdio: "inherit" });
-      execFileSync("cp", ["-r", path.join(ROOT, "scripts"), path.join(buildCtx, "scripts")], { stdio: "inherit" });
-      execFileSync("rm", ["-rf", path.join(buildCtx, "nemoclaw", "node_modules")], { stdio: "ignore" });
-
-      const basePolicyPath = path.join(ROOT, "nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml");
-      const envArgs = [];
-      if (process.env.NVIDIA_API_KEY) envArgs.push(`NVIDIA_API_KEY=${process.env.NVIDIA_API_KEY}`);
-
-      try {
-        execFileSync(
-          "openshell",
-          ["sandbox", "create", "--from", path.join(buildCtx, "Dockerfile"), "--name", sandboxName, "--policy", basePolicyPath, "--", "env", ...envArgs, "nemoclaw-start"],
-          { stdio: "inherit", timeout: 300000 }
-        );
-      } catch (err) {
-        console.error(`  Failed to create sandbox: ${err.message}`);
-        execFileSync("rm", ["-rf", buildCtx], { stdio: "ignore" });
-        process.exit(1);
-      }
-      execFileSync("rm", ["-rf", buildCtx], { stdio: "ignore" });
-
-      registry.registerSandbox({
-        name: sandboxName,
-        model: "anthropic/claude-sonnet-4-6",
-        provider: "openshell",
-        gpuEnabled: false,
-        policies: [],
-      });
-      console.log(`  Sandbox '${sandboxName}' created and registered.`);
-      await applyDefaultPolicies(sandboxName);
-    }
-  }
-
-  // Create per-user persist directories
-  const persistBase = `persist/users/${slackUserId}`;
-  const credDir = `${persistBase}/credentials`;
-  const workspaceDir = `${persistBase}/workspace`;
+  // Create per-user persist directories and registry entry before provisioning so
+  // a slow or hanging sandbox create cannot leave an orphan sandbox with no user.
   fs.mkdirSync(path.join(ROOT, credDir), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(ROOT, workspaceDir), { recursive: true });
 
-  // Copy default personality files if workspace is empty
   const defaultWorkspace = path.join(ROOT, "persist", "workspace");
   const userWorkspace = path.join(ROOT, workspaceDir);
   if (fs.existsSync(defaultWorkspace)) {
-    const files = ["SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "AGENTS.md", "BOOTSTRAP.md"];
-    for (const f of files) {
-      const src = path.join(defaultWorkspace, f);
-      const dst = path.join(userWorkspace, f);
-      if (fs.existsSync(src) && !fs.existsSync(dst)) {
-        fs.copyFileSync(src, dst);
-      }
-    }
+    copySharedWorkspaceFiles(ROOT, userWorkspace);
     console.log("  Default personality files copied to user workspace.");
   }
 
-  // Register user
   userReg.registerUser({
     slackUserId,
     slackDisplayName,
@@ -1161,6 +1164,33 @@ async function userAdd(args = []) {
     enabled: true,
     roles: argAdmin ? ["user", "admin"] : ["user"],
   });
+  createdUser = true;
+
+  if (!sbExists) {
+    const create = nonInteractive ? "y" : await askPrompt(`  Sandbox '${sandboxName}' not registered. Create it? [Y/n]: `);
+    if (create.toLowerCase() !== "n") {
+      console.log(`  Creating sandbox '${sandboxName}' (this may take a few minutes on first run)...`);
+
+      try {
+        createSandboxWithRecovery(sandboxName, { repoRoot: ROOT, stdio: "inherit" });
+      } catch (err) {
+        console.error(`  Failed to create sandbox: ${err.message}`);
+        cleanupProvisioningArtifacts(slackUserId, sandboxName, persistBase, createdUser, createdSandboxRegistryEntry);
+        process.exit(1);
+      }
+
+      registry.registerSandbox({
+        name: sandboxName,
+        model: "anthropic/claude-sonnet-4-6",
+        provider: "openshell",
+        gpuEnabled: false,
+        policies: [],
+      });
+      createdSandboxRegistryEntry = true;
+      console.log(`  Sandbox '${sandboxName}' created and registered.`);
+      await applyDefaultPolicies(sandboxName);
+    }
+  }
 
   const roles = userReg.getUser(slackUserId)?.roles || ["user"];
 
@@ -1404,6 +1434,222 @@ function userSetAdmin(slackUserId, grantAdmin) {
   console.log("");
   console.log(`  User ${user.slackDisplayName || slackUserId} roles: ${[...roles].join(", ")}`);
   console.log("");
+}
+
+function migrationExport(args = []) {
+  let outputDir = null;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--output") outputDir = args[++i];
+  }
+
+  try {
+    const result = exportMultiUserState({ outputDir });
+    console.log("");
+    console.log(`  Migration bundle exported: ${result.bundleRoot}`);
+    console.log(`  Users captured: ${Object.keys(result.manifest.users || {}).length}`);
+    console.log(`  Deleted users tracked: ${(result.manifest.registries.deletedUsers || []).length}`);
+    console.log("");
+  } catch (err) {
+    console.error(`  Migration export failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function migrationImport(args = []) {
+  let inputDir = null;
+  let force = false;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--input") inputDir = args[++i];
+    else if (args[i] === "--force") force = true;
+  }
+
+  if (!inputDir) {
+    console.error("  Usage: nemoclaw migration-import --input <bundle-dir> [--force]");
+    process.exit(1);
+  }
+
+  try {
+    const result = importMultiUserState({ inputDir, force });
+    console.log("");
+    console.log(`  Migration bundle imported: ${result.bundleRoot}`);
+    console.log(`  Users restored: ${Object.keys(result.manifest.users || {}).length}`);
+    console.log(`  Paths restored: ${result.copied.length}`);
+    console.log("");
+  } catch (err) {
+    console.error(`  Migration import failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function migrationInspect(args = []) {
+  let inputDir = null;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--input") inputDir = args[++i];
+  }
+
+  if (!inputDir) {
+    console.error("  Usage: nemoclaw migration-inspect --input <bundle-dir>");
+    process.exit(1);
+  }
+
+  try {
+    const result = inspectMultiUserState({ inputDir });
+    console.log("");
+    console.log(result.summary);
+    console.log("");
+  } catch (err) {
+    console.error(`  Migration inspect failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function migrationRestoreUser(args = []) {
+  let inputDir = null;
+  let slackUserId = null;
+  let force = false;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--input") inputDir = args[++i];
+    else if (args[i] === "--slack-id") slackUserId = args[++i];
+    else if (args[i] === "--force") force = true;
+  }
+
+  if (!inputDir || !slackUserId) {
+    console.error("  Usage: nemoclaw migration-restore-user --input <bundle-dir> --slack-id <id> [--force]");
+    process.exit(1);
+  }
+
+  try {
+    const result = restoreUserFromBundle({ inputDir, slackUserId, force });
+    console.log("");
+    console.log(`  Restored user: ${result.user.slackDisplayName || slackUserId} (${slackUserId})`);
+    console.log(`  Sandbox: ${result.user.sandboxName || "-"}`);
+    console.log(`  Files restored: ${result.copied.length}`);
+    console.log(`  Marker: ${path.join(ROOT, "persist", "migration", "restored-users", `${slackUserId}.json`)}`);
+    console.log("");
+  } catch (err) {
+    console.error(`  User restore failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function migrationRestoreAll(args = []) {
+  let inputDir = null;
+  let force = false;
+  let includeDisabled = false;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--input") inputDir = args[++i];
+    else if (args[i] === "--force") force = true;
+    else if (args[i] === "--include-disabled") includeDisabled = true;
+  }
+
+  if (!inputDir) {
+    console.error("  Usage: nemoclaw migration-restore-all --input <bundle-dir> [--force] [--include-disabled]");
+    process.exit(1);
+  }
+
+  try {
+    const result = restoreAllUsersFromBundle({ inputDir, force, includeDisabled });
+    console.log("");
+    console.log(`  Restored users from bundle: ${result.bundleRoot}`);
+    console.log(`  Users restored: ${result.restoredUsers.length}`);
+    for (const restored of result.restoredUsers) {
+      console.log(`    ${restored.user.slackDisplayName || restored.slackUserId} -> ${restored.user.sandboxName || "-"}`);
+    }
+    console.log("");
+  } catch (err) {
+    console.error(`  Bundle restore failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function bootstrapUserCommand(args = []) {
+  const slackUserId = args.find((arg) => !arg.startsWith("-"));
+  const dryRun = args.includes("--dry-run");
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw bootstrap-user <slack-user-id> [--dry-run]");
+    process.exit(1);
+  }
+  try {
+    const result = bootstrapUser(slackUserId, { dryRun });
+    console.log("");
+    console.log(formatBootstrapPlan(result.plan));
+    if (dryRun) {
+      console.log("\n  Dry run only. No sandbox changes were made.");
+    } else {
+      console.log(`\n  Workspace files seeded: ${result.copiedWorkspaceFiles.length}`);
+      console.log(`  Policies applied: ${result.appliedPolicies.join(", ") || "-"}`);
+      console.log("  Bootstrap complete.");
+    }
+    console.log("");
+  } catch (err) {
+    console.error(`  Bootstrap failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function bootstrapAllCommand(args = []) {
+  const dryRun = args.includes("--dry-run");
+  const includeDisabled = args.includes("--include-disabled");
+  try {
+    const results = bootstrapAll({ dryRun, includeDisabled });
+    console.log("");
+    if (results.length === 0) {
+      console.log("  No users selected for bootstrap.\n");
+      return;
+    }
+    for (const result of results) {
+      console.log(formatBootstrapPlan(result.plan));
+      console.log("");
+    }
+    if (dryRun) console.log("  Dry run only. No sandbox changes were made.\n");
+    else console.log(`  Bootstrapped ${results.length} user(s).\n`);
+  } catch (err) {
+    console.error(`  Bootstrap failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function reconcileUserCommand(args = []) {
+  const slackUserId = args.find((arg) => !arg.startsWith("-"));
+  const dryRun = args.includes("--dry-run");
+  if (!slackUserId) {
+    console.error("  Usage: nemoclaw reconcile-user <slack-user-id> [--dry-run]");
+    process.exit(1);
+  }
+  try {
+    const result = reconcileUser(slackUserId, { dryRun });
+    console.log("");
+    console.log(formatReconcilePlan(result.plan));
+    if (dryRun) console.log("\n  Dry run only. No sandbox changes were made.");
+    else console.log("\n  Reconcile complete.");
+    console.log("");
+  } catch (err) {
+    console.error(`  Reconcile failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function reconcileAllCommand(args = []) {
+  const dryRun = args.includes("--dry-run");
+  const includeDisabled = args.includes("--include-disabled");
+  try {
+    const results = reconcileAll({ dryRun, includeDisabled });
+    console.log("");
+    if (results.length === 0) {
+      console.log("  No users selected for reconcile.");
+      console.log("");
+      return;
+    }
+    for (const result of results) {
+      console.log(formatReconcilePlan(result.plan));
+      console.log("");
+    }
+    if (dryRun) console.log("  Dry run only. No sandbox changes were made.\n");
+    else console.log(`  Reconciled ${results.length} user(s).\n`);
+  } catch (err) {
+    console.error(`  Reconcile failed: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 // ── Sandbox-scoped actions ───────────────────────────────────────
@@ -1663,6 +1909,15 @@ function help() {
     nemoclaw user-disable <slack-id> Disable a registered user in the Slack bridge
     nemoclaw user-grant-admin <id>   Grant admin role to a registered user
     nemoclaw user-revoke-admin <id>  Revoke admin role from a registered user
+    nemoclaw migration-export [--output DIR]   Export local multi-user state bundle
+    nemoclaw migration-import --input DIR [--force]  Restore a local multi-user state bundle
+    nemoclaw migration-inspect --input DIR     Summarize a local multi-user state bundle
+    nemoclaw migration-restore-user --input DIR --slack-id ID [--force]  Restore one user from a bundle
+    nemoclaw migration-restore-all --input DIR [--force] [--include-disabled]  Restore all users from a bundle
+    nemoclaw bootstrap-user <id> [--dry-run]   Create/adopt one user's sandbox and seed workspace defaults
+    nemoclaw bootstrap-all [--dry-run] [--include-disabled]  Bootstrap sandboxes for all registered users
+    nemoclaw reconcile-user <id> [--dry-run]   Reconcile one user's credentials into their sandbox
+    nemoclaw reconcile-all [--dry-run] [--include-disabled]  Reconcile all registered users
 
   ${G}Deploy:${R}
     nemoclaw deploy <instance>       Deploy to a Brev VM and start services
@@ -1761,6 +2016,33 @@ const [cmd, ...args] = process.argv.slice(2);
         break;
       case "user-revoke-admin":
         userSetAdmin(args[0], false);
+        break;
+      case "migration-export":
+        migrationExport(args);
+        break;
+      case "migration-import":
+        migrationImport(args);
+        break;
+      case "migration-inspect":
+        migrationInspect(args);
+        break;
+      case "migration-restore-user":
+        migrationRestoreUser(args);
+        break;
+      case "migration-restore-all":
+        migrationRestoreAll(args);
+        break;
+      case "bootstrap-user":
+        bootstrapUserCommand(args);
+        break;
+      case "bootstrap-all":
+        bootstrapAllCommand(args);
+        break;
+      case "reconcile-user":
+        reconcileUserCommand(args);
+        break;
+      case "reconcile-all":
+        reconcileAllCommand(args);
         break;
       case "--version":
       case "-v": {

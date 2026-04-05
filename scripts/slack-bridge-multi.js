@@ -49,6 +49,10 @@ const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication
 const RATE_LIMIT_RE = /rate.limit|429|too many requests|overloaded|capacity/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
 const pendingDeleteRequests = new Map();
+const FRESHRELEASE_HELPER = path.join(REPO_DIR, "scripts", "freshrelease-epics.py");
+const GOG_HELPER = path.join(REPO_DIR, "scripts", "gog-query.py");
+const lastFreshreleaseRequests = new Map();
+const lastUserRequests = new Map();
 
 // ── Global rate limit throttle ───────────────────────────────────
 // When a rate limit is detected, pause all new agent launches for a cooldown.
@@ -117,12 +121,13 @@ function canonicalizeAdminCommand(text) {
     .replace(/^!admin\s+help\b/i, "!admin-help")
     .replace(/^!help\s+admin\b/i, "!help-admin")
     .replace(/^!add\s+claw\b/i, "!add-claw")
+    .replace(/^!purge\s+claw\b/i, "!purge-claw")
     .replace(/^!delete\s+claw\b/i, "!delete-claw")
     .replace(/^!confirm(?:-|\s+)delete(?:-|\s+)claw\b/i, "!confirm-delete-claw");
 }
 
 function looksLikeAdminCommand(text) {
-  return /^!(show|list|admin|help|add|delete|confirm)\b/i.test(canonicalizeAdminCommand(text).trim());
+  return /^!(show|list|admin|help|add|delete|confirm|purge)\b/i.test(canonicalizeAdminCommand(text).trim());
 }
 
 function isListAdminsCommand(text) {
@@ -148,6 +153,285 @@ function isShowUserCommand(text) {
 function isAdminHelpCommand(text) {
   const normalized = canonicalizeAdminCommand(text).toLowerCase();
   return normalized === "!admin-help" || normalized === "!help-admin";
+}
+
+function isPurgeClawCommand(text) {
+  return canonicalizeAdminCommand(text).toLowerCase().startsWith("!purge-claw");
+}
+
+function isKnownBangCommand(text) {
+  const normalized = normalizeText(text);
+  if (!normalized.startsWith("!")) return false;
+  return isListAdminsCommand(text)
+    || isAdminAuditCommand(text)
+    || isShowClawsCommand(text)
+    || isShowUserCommand(text)
+    || isAdminHelpCommand(text)
+    || isAddClawCommand(text)
+    || isPurgeClawCommand(text)
+    || isDeleteClawCommand(text)
+    || isConfirmDeleteClawCommand(text)
+    || isSetupCommand(text)
+    || /^!whatsapp\b|^!wa\b/i.test(normalized)
+    || /^!yahoo\b/i.test(normalized);
+}
+
+function parseFreshreleaseEpicRequest(text) {
+  const normalized = normalizeText(text);
+  if (!/\bepics?\b/i.test(normalized)) return null;
+  const projects = extractFreshreleaseProjects(normalized);
+  if (projects.length === 0) return null;
+  const limitMatch = normalized.match(/\b(?:top|get|show|list)?\s*(\d+)\s+(?:most\s+active\s+)?epics?\b/i)
+    || normalized.match(/\bmost\s+active\s+epics?\b.*?\b(\d+)\b/i);
+  const parsedLimit = limitMatch ? Number.parseInt(limitMatch[1], 10) : 3;
+  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 10)) : 3;
+  return { projects, limit, statusQuery: parseFreshreleaseStatusQuery(normalized) };
+}
+
+function parseFreshreleaseChildrenRequest(text) {
+  const normalized = normalizeText(text);
+  if (!/\b(stories|story|children|child|issues)\b/i.test(normalized) || !/\bunder\b/i.test(normalized)) return null;
+  const match = normalized.toUpperCase().match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
+  if (!match) return null;
+  return { parentKey: match[1], statusQuery: parseFreshreleaseStatusQuery(normalized) };
+}
+
+function parseFreshreleaseIssueDetailRequest(text) {
+  const normalized = normalizeText(text);
+  if (!/\b(detail|details|describe|show|description|comments?)\b/i.test(normalized)) return null;
+  const match = normalized.toUpperCase().match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
+  if (!match) return null;
+  return { issueKey: match[1] };
+}
+
+function extractFreshreleaseProjects(text) {
+  const normalized = normalizeText(text).toUpperCase();
+  const issuePrefixes = [...normalized.matchAll(/\b([A-Z][A-Z0-9]+)-\d+\b/g)].map((match) => match[1]);
+  const uppercaseTokens = normalized.match(/\b[A-Z][A-Z0-9]{2,}\b/g) || [];
+  const stopWords = new Set([
+    "ACTIVE", "ALL", "AND", "ARE", "ASSIGNED", "BACKLOG", "BOARD", "BY", "COMMENTS",
+    "CURRENT", "DATE", "DESCRIPTION", "DETAIL", "DETAILS", "DONE", "EPIC", "EPICS",
+    "FOR", "FRESHRELEASE", "FROM", "GET", "IN", "ISSUE", "ISSUES", "LIST", "MOST",
+    "MY", "OPEN", "SHOW", "SPRINT", "STATE", "STATUS", "STORIES", "STORY", "TASK",
+    "TASKS", "THE", "TICKET", "TICKETS", "TOP", "UNDER", "UPDATED", "WITH",
+  ]);
+  const candidates = [...issuePrefixes, ...uppercaseTokens]
+    .filter((token) => !stopWords.has(token))
+    .filter((token) => !/^\d+$/.test(token));
+  return [...new Set(candidates)];
+}
+
+function parseFreshreleaseStatusQuery(text) {
+  const normalized = normalizeText(text).toLowerCase();
+  const patterns = [
+    /\bready to test\b/,
+    /\bin review\b/,
+    /\bin progress\b/,
+    /\bto do\b/,
+    /\btodo\b/,
+    /\bblocked\b/,
+    /\bbacklog\b/,
+    /\breopened\b/,
+    /\bdone\b/,
+    /\bopen\b/,
+  ];
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match) return match[0];
+  }
+  return "";
+}
+
+function hasFreshreleaseCredentials(user) {
+  if (!user) return false;
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  return fs.existsSync(path.join(credentialsDir, "freshrelease-api-key.txt"));
+}
+
+function hasGoogleCredentials(user) {
+  if (!user) return false;
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  return fs.existsSync(path.join(credentialsDir, "gogcli", "config.json"));
+}
+
+function getUserEnvVars(user) {
+  const envPath = path.join(REPO_DIR, "persist", "users", user.slackUserId, ".env");
+  const values = {};
+  if (!fs.existsSync(envPath)) return values;
+  for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index <= 0) continue;
+    const key = trimmed.slice(0, index).trim();
+    const value = trimmed.slice(index + 1).trim();
+    values[key] = value;
+  }
+  return values;
+}
+
+function runGoogleHelper(user, request) {
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  const gogDir = path.join(credentialsDir, "gogcli");
+  if (!fs.existsSync(path.join(gogDir, "config.json"))) {
+    throw new Error("Google gogcli credentials are not configured for this user.");
+  }
+  if (!fs.existsSync(GOG_HELPER)) {
+    throw new Error("Google helper script is missing.");
+  }
+  const userEnv = getUserEnvVars(user);
+  const keyringPassword = userEnv.GOG_KEYRING_PASSWORD || process.env.GOG_KEYRING_PASSWORD || "";
+  if (!keyringPassword) {
+    throw new Error("GOG_KEYRING_PASSWORD is not configured for this user.");
+  }
+  const args = request.kind === "tasks"
+    ? [
+      "--tasks",
+      "--limit", String(request.limit),
+      "--status", request.status,
+      "--list-query", request.listQuery || "",
+      "--prefer-personal", request.preferPersonal ? "1" : "0",
+    ]
+    : ["--calendar", "--limit", String(request.limit), "--range", request.range];
+  return execFileSync("python3", [GOG_HELPER, ...args], {
+    cwd: REPO_DIR,
+    encoding: "utf-8",
+    timeout: 45000,
+    env: {
+      ...process.env,
+      GOG_CONFIG_DIR: gogDir,
+      GOG_KEYRING_PASSWORD: keyringPassword,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function parseGoogleRequest(text) {
+  const normalized = normalizeText(text);
+  const lower = normalized.toLowerCase();
+  if (!/\b(google|gmail|calendar|meeting|event|events|task|tasks)\b/i.test(normalized)) return null;
+  const limitMatch = lower.match(/\b(?:top|first|show|list|get)?\s*(\d+)\b/);
+  const limit = limitMatch ? Math.max(1, Math.min(Number.parseInt(limitMatch[1], 10) || 5, 25)) : 5;
+  if (/\btasks?\b/.test(lower)) {
+    let status = "open";
+    if (/\bcompleted|done\b/.test(lower)) status = "completed";
+    if (/\ball tasks?\b/.test(lower)) status = "all";
+    let listQuery = "";
+    const fromMatch = lower.match(/\bfrom\s+([a-z0-9][a-z0-9 '&-]*?)\s+tasks?\b/i);
+    if (fromMatch?.[1]) listQuery = fromMatch[1].trim();
+    const possessiveMatch = lower.match(/\bmy\s+([a-z0-9][a-z0-9 '&-]*?)\s+tasks?\b/i);
+    if (!listQuery && possessiveMatch?.[1] && !/\bpersonal\b/i.test(possessiveMatch[1])) listQuery = possessiveMatch[1].trim();
+    const preferPersonal = /\bpersonal tasks?\b|\bmy tasks?\b/.test(lower) && !listQuery;
+    return { kind: "tasks", limit, status, listQuery, preferPersonal };
+  }
+  if (/\b(calendar|event|events|meeting|meetings)\b/.test(lower)) {
+    let range = "upcoming";
+    if (/\btoday\b/.test(lower)) range = "today";
+    else if (/\btomorrow\b/.test(lower)) range = "tomorrow";
+    else if (/\bthis week\b/.test(lower)) range = "week";
+    return { kind: "calendar", limit, range };
+  }
+  return null;
+}
+
+function runFreshreleaseEpicHelper(user, request) {
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
+  if (!fs.existsSync(apiKeyPath)) {
+    throw new Error("Freshrelease API key is not configured for this user.");
+  }
+  if (!fs.existsSync(FRESHRELEASE_HELPER)) {
+    throw new Error("Freshrelease helper script is missing.");
+  }
+  const apiKey = fs.readFileSync(apiKeyPath, "utf-8").trim();
+  if (!apiKey) {
+    throw new Error("Freshrelease API key is empty.");
+  }
+  return execFileSync("python3", [FRESHRELEASE_HELPER, ...request.projects], {
+    cwd: REPO_DIR,
+    encoding: "utf-8",
+    timeout: 45000,
+    env: {
+      ...process.env,
+      FRESHRELEASE_API_KEY: apiKey,
+      FR_EPIC_LIMIT: String(request.limit),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function runFreshreleaseHelper(user, args = [], extraEnv = {}) {
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
+  if (!fs.existsSync(apiKeyPath)) {
+    throw new Error("Freshrelease API key is not configured for this user.");
+  }
+  if (!fs.existsSync(FRESHRELEASE_HELPER)) {
+    throw new Error("Freshrelease helper script is missing.");
+  }
+  const apiKey = fs.readFileSync(apiKeyPath, "utf-8").trim();
+  if (!apiKey) {
+    throw new Error("Freshrelease API key is empty.");
+  }
+  return execFileSync("python3", [FRESHRELEASE_HELPER, ...args], {
+    cwd: REPO_DIR,
+    encoding: "utf-8",
+    timeout: 45000,
+    env: {
+      ...process.env,
+      FRESHRELEASE_API_KEY: apiKey,
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function getFreshreleaseApiKey(user) {
+  if (!user) return "";
+  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
+  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
+  if (!fs.existsSync(apiKeyPath)) return "";
+  return fs.readFileSync(apiKeyPath, "utf-8").trim();
+}
+
+function redactSensitiveText(text, user) {
+  let redacted = String(text || "");
+  const apiKey = getFreshreleaseApiKey(user);
+  if (apiKey) {
+    redacted = redacted.split(apiKey).join("[REDACTED]");
+  }
+  redacted = redacted.replace(/(API key:\s*_?)[A-Za-z0-9_-]+/gi, "$1[REDACTED]");
+  redacted = redacted.replace(/(Authorization:\s*Token\s+)[^\s]+/gi, "$1[REDACTED]");
+  redacted = redacted.replace(/(FRESHRELEASE_API_KEY\s*[=:]\s*)[^\s"'`]+/gi, "$1[REDACTED]");
+  redacted = redacted.replace(/(sk-ant-[A-Za-z0-9_-]+)/g, "[REDACTED]");
+  return redacted;
+}
+
+function isRetryCommand(text) {
+  const normalized = normalizeText(text).trim().toLowerCase();
+  return normalized === "retry"
+    || normalized === "try again"
+    || normalized === "retry that"
+    || /^retry my last\b/.test(normalized)
+    || /^retry last\b/.test(normalized);
+}
+
+function recordFreshreleaseRequest(slackUserId, request) {
+  if (!slackUserId || !request) return;
+  lastFreshreleaseRequests.set(slackUserId, request);
+}
+
+function getRecordedFreshreleaseRequest(slackUserId) {
+  return lastFreshreleaseRequests.get(slackUserId) || null;
+}
+
+function recordLastUserRequest(slackUserId, text) {
+  if (!slackUserId || !text || isRetryCommand(text)) return;
+  lastUserRequests.set(slackUserId, text);
+}
+
+function getRecordedLastUserRequest(slackUserId) {
+  return lastUserRequests.get(slackUserId) || "";
 }
 
 function parseCommandArgs(text) {
@@ -300,6 +584,7 @@ function formatAdminHelp() {
     "`!show-claws [ready|not-ready|registered|unregistered|admins|non-admins|gpu] [sort=name|user|status|uptime] [match=...] [policy=...] [cred=...]`",
     "`!show-user <slack-id|claw-name|name-fragment>`",
     "`!add-claw <slack_id> <display_name> <claw_name> <github_handle>`",
+    "`!purge-claw <claw_name>`",
     "`!delete-claw <claw_name>`",
     "`!confirm-delete-claw <claw_name>`",
     "",
@@ -405,6 +690,14 @@ function buildAuthRecoveryMessage(user) {
 
 function requestLikelyNeedsMcp(text) {
   return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b|\bticket\b|\btask\b|\bsprint\b|\bbacklog\b|\bboard\b|\bassigned\b|\bcalendar\b|\bevent\b|\bmeeting\b|\bgmail\b|\bemail\b|\binbox\b|\bgoogle\b|\bdocs\b|\bdrive\b/i.test(String(text || ""));
+}
+
+function shouldUseDirectClaudeCode(text) {
+  const normalized = normalizeText(text);
+  const hasRepoOrCodeTarget = /\b(repo|repository|pull request|pr\b|branch\b|commit\b|java\b|gradle\b|maven\b|go\b|typescript\b|python\b|test\b|tests\b)\b/i.test(normalized);
+  const hasCodingAction = /\b(migrate|refactor|implement|fix|port|convert|rewrite|create|open|send|raise|submit|run)\b/i.test(normalized);
+  const excludes = /\b(freshrelease|gmail|calendar|yahoo|whatsapp|email|epic|story|issue|ticket)\b/i.test(normalized);
+  return hasRepoOrCodeTarget && hasCodingAction && !excludes;
 }
 
 function listConfiguredCredentials(user) {
@@ -937,6 +1230,50 @@ async function handleConfirmDeleteClaw(user, text) {
   }
 }
 
+async function handlePurgeClaw(user, text) {
+  const args = parseCommandArgs(canonicalizeAdminCommand(text)).slice(1);
+  if (args.length !== 1) {
+    return {
+      ok: false,
+      message: "Usage: `!purge-claw <claw_name>`\nExample: `!purge-claw alice-claw`",
+    };
+  }
+
+  const clawName = args[0];
+  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(clawName)) {
+    return { ok: false, message: `Invalid claw name: \`${clawName}\`.` };
+  }
+
+  auditAdminAction(user, "purge-claw", { clawName }, "started");
+
+  try {
+    const purgeOutput = runAdminCommand(process.execPath, [
+      "bin/nemoclaw.js",
+      "user-purge",
+      "--sandbox",
+      clawName,
+    ], 600000);
+    auditAdminAction(user, "purge-claw", { clawName }, "succeeded");
+    return {
+      ok: true,
+      message: [
+        `Purged claw \`${clawName}\`.`,
+        "",
+        "```",
+        purgeOutput.trim().slice(-3000) || "(no output)",
+        "```",
+      ].join("\n"),
+    };
+  } catch (err) {
+    const output = `${err.stdout || ""}${err.stderr || ""}`.trim() || err.message;
+    auditAdminAction(user, "purge-claw", { clawName }, "failed", output.slice(0, 1000));
+    return {
+      ok: false,
+      message: `Failed to purge claw \`${clawName}\`.\n\`\`\`\n${output.slice(-3500)}\n\`\`\``,
+    };
+  }
+}
+
 function refreshCredentials(sandboxName, credDir = "") {
   console.log(`[refresh] Triggering credential refresh for ${sandboxName}...`);
   try {
@@ -1000,7 +1337,17 @@ function getRuntimeFallbackModels(sandboxName) {
 }
 
 function buildAgentCommand(message, sessionId, user, options = {}) {
-  const escaped = message.replace(/'/g, "'\\''");
+  const executionGuardrails = [
+    "Slack execution rules:",
+    "- Do not start background Claude Code sessions or detached jobs for user requests.",
+    "- Do not say work is running in the background.",
+    "- If you use Claude Code or any coding tool, keep it in the foreground and wait for completion.",
+    "- Only report success after the requested work, tests, and PR creation are actually complete.",
+    "- If blocked, report the concrete blocker instead of claiming ongoing background progress.",
+    "",
+    `User request: ${message}`,
+  ].join("\n");
+  const escaped = executionGuardrails.replace(/'/g, "'\\''");
   const setupLines = [
     `export NVIDIA_API_KEY='${sh(API_KEY)}'`,
     `export OPENAI_API_KEY='${sh(API_KEY)}'`,
@@ -1021,6 +1368,33 @@ function buildAgentCommand(message, sessionId, user, options = {}) {
   scriptLines.push(`find /sandbox/.openclaw/agents -name '*.lock' -mmin +2 -delete 2>/dev/null || true`);
   scriptLines.push(`nemoclaw-start openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
   return scriptLines.join("\n");
+}
+
+function buildClaudeCodeCommand(message, user) {
+  const claudePrompt = [
+    "Slack execution rules:",
+    "- Stay in the foreground until the requested work is complete or you hit a concrete blocker.",
+    "- Do not spawn detached or background jobs.",
+    "- If tests are requested, run them and include the result.",
+    "- If a PR is requested, only open it after tests pass and return the clickable PR URL.",
+    "- If blocked, say exactly what failed and what evidence you gathered.",
+    "- For repository tasks, do not guess repo names or claim the repo is missing until you have checked with gh.",
+    "- If the prompt names a repo, first try an exact lookup with the configured GitHub user and that repo name, e.g. gh repo view <user>/<repo-from-prompt>.",
+    "- If the prompt does not name a repo, or the exact lookup fails, use gh to list/search candidate repositories for the configured GitHub user before asking for a repo URL.",
+    "- Prefer the configured GitHub user and the active gh account over Slack display name or other inferred identities.",
+    "",
+    `Slack user: ${user.slackDisplayName || user.slackUserId}`,
+    `GitHub user: ${user.githubUser || "unknown"}`,
+    `Task: ${message}`,
+  ].join("\n");
+  return [
+    "set -a; . /sandbox/.env; set +a",
+    "cd /sandbox/.openclaw-data/workspace",
+    "export HOME=/sandbox",
+    "export PATH=/usr/local/bin:/usr/bin:/bin:$PATH",
+    `export NEMOCLAW_GITHUB_USER='${sh(user.githubUser || "")}'`,
+    `timeout 3600 claude --permission-mode bypassPermissions --print '${claudePrompt.replace(/'/g, "'\\''")}'`,
+  ].join("\n");
 }
 
 function syncSandboxSelectionConfig(user, provider, model) {
@@ -1307,7 +1681,7 @@ function mdLinksToSlack(text) {
 }
 
 function cellHasLinks(text) {
-  return /\[([^\]]+)\]\(([^)]+)\)/.test(String(text));
+  return /\[([^\]]+)\]\(([^)]+)\)/.test(String(text)) || /https?:\/\/\S+/i.test(String(text));
 }
 
 function tableHasLinks(header, rows) {
@@ -1340,18 +1714,41 @@ function stripMdLinks(text) {
   return String(text).replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
 }
 
+function findPreferredLinkLabel(header, row, fallbackIndex = 0) {
+  const preferredColumns = ["Task", "Title", "Key", "Name", "Project"];
+  for (const column of preferredColumns) {
+    const index = header.findIndex((value) => String(value).trim().toLowerCase() === column.toLowerCase());
+    if (index >= 0 && row[index] && String(row[index]).trim()) {
+      return stripMdLinks(String(row[index]).trim());
+    }
+  }
+  const fallback = row[fallbackIndex];
+  return stripMdLinks(String(fallback || "").trim()) || "Open";
+}
+
 // Extract all markdown links from text as Slack mrkdwn links
-function extractLinks(rows) {
+function extractLinks(header, rows) {
   const links = [];
   const seen = new Set();
   for (const row of rows) {
-    for (const cell of row) {
+    const rowLabel = findPreferredLinkLabel(header, row);
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i];
+      const text = String(cell);
       const re = /\[([^\]]+)\]\(([^)]+)\)/g;
       let m;
-      while ((m = re.exec(String(cell))) !== null) {
+      while ((m = re.exec(text)) !== null) {
         if (!seen.has(m[2])) {
           seen.add(m[2]);
-          links.push(`<${m[2]}|${m[1]}>`);
+          const linkLabel = (m[1] && m[1] !== "Open") ? m[1] : rowLabel;
+          links.push(`<${m[2]}|${linkLabel}>`);
+        }
+      }
+      const rawUrls = text.match(/https?:\/\/\S+/ig) || [];
+      for (const url of rawUrls) {
+        if (!seen.has(url)) {
+          seen.add(url);
+          links.push(`<${url}|${rowLabel}>`);
         }
       }
     }
@@ -1360,28 +1757,51 @@ function extractLinks(rows) {
 }
 
 function buildSlackTableBlock(header, rows) {
-  const colCount = header.length;
+  let workingHeader = [...header];
+  let workingRows = rows.map((row) => [...row]);
+  const linkColumnIndexes = workingHeader
+    .map((value, index) => ({ value: String(value).trim().toLowerCase(), index }))
+    .filter(({ value }) => value === "link" || value === "url")
+    .map(({ index }) => index);
+  if (linkColumnIndexes.length > 0) {
+    const removable = linkColumnIndexes.filter((index) =>
+      workingRows.every((row) => {
+        const cell = String(row[index] || "");
+        return !cell || cellHasLinks(cell);
+      })
+    );
+    if (removable.length > 0) {
+      workingHeader = workingHeader.filter((_, index) => !removable.includes(index));
+      workingRows = workingRows.map((row) => row.filter((_, index) => !removable.includes(index)));
+    }
+  }
+
+  const colCount = workingHeader.length;
   const hasLinks = tableHasLinks(header, rows);
+  const slackCell = (value) => {
+    const text = stripMdLinks(value).slice(0, 120);
+    return { type: "raw_text", text: text || " " };
+  };
 
   // Always use native table block — strip links from cells to plain text
   const slackRows = [
-    header.map((h) => ({ type: "raw_text", text: stripMdLinks(h).slice(0, 120) })),
-    ...rows.map((row) => {
-      const cells = row.map((cell) => ({ type: "raw_text", text: stripMdLinks(cell).slice(0, 120) }));
-      while (cells.length < colCount) cells.push({ type: "raw_text", text: "" });
+    workingHeader.map((h) => slackCell(h)),
+    ...workingRows.map((row) => {
+      const cells = row.map((cell) => slackCell(cell));
+      while (cells.length < colCount) cells.push(slackCell(""));
       return cells.slice(0, colCount);
     }),
   ];
 
   const tableBlock = {
     type: "table",
-    column_settings: header.map(() => ({ is_wrapped: true })),
+    column_settings: workingHeader.map(() => ({ is_wrapped: true })),
     rows: slackRows,
   };
 
   // If links were present, return table + links section
   if (hasLinks) {
-    const links = extractLinks(rows);
+    const links = extractLinks(header, rows);
     if (links.length > 0) {
       return [
         tableBlock,
@@ -1431,19 +1851,10 @@ function buildSlackTablePayload(response) {
     }
     const after = response.slice(cursor).trim();
     if (after) blocks.push({ type: "section", text: { type: "mrkdwn", text: mdToSlack(mdLinksToSlack(after)).slice(0, 3000) } });
-
-    const tableBlocks = blocks.filter((b) => b.type === "table");
-    const nonTableBlocks = blocks.filter((b) => b.type !== "table");
-    const payload = { text: response.slice(0, 200) };
-    if (tableBlocks.length > 0) {
-      // Native table blocks go in attachments, everything else in main blocks
-      if (nonTableBlocks.length > 0) payload.blocks = nonTableBlocks.slice(0, 20);
-      payload.attachments = [{ blocks: tableBlocks.slice(0, 5) }];
-    } else {
-      // All blocks are sections/rich_text (no native tables)
-      payload.blocks = blocks.slice(0, 20);
-    }
-    return payload;
+    return {
+      text: response.slice(0, 200),
+      blocks: blocks.slice(0, 20),
+    };
   }
 
   // Strategy 2: Look for structured numbered/bullet lists
@@ -1451,18 +1862,68 @@ function buildSlackTablePayload(response) {
   if (listData) {
     const blocks = [];
     if (listData.before) blocks.push({ type: "section", text: { type: "mrkdwn", text: mdToSlack(mdLinksToSlack(listData.before)).slice(0, 3000) } });
-    const tableBlocks = buildSlackTableBlock(listData.header, listData.rows);
+    blocks.push(...buildSlackTableBlock(listData.header, listData.rows));
     if (listData.after) blocks.push({ type: "section", text: { type: "mrkdwn", text: mdToSlack(mdLinksToSlack(listData.after)).slice(0, 3000) } });
-
-    const nativeTableBlocks = tableBlocks.filter((b) => b.type === "table");
-    const otherBlocks = [...blocks, ...tableBlocks.filter((b) => b.type !== "table")];
-    const payload = { text: response.slice(0, 200) };
-    if (otherBlocks.length > 0) payload.blocks = otherBlocks.slice(0, 20);
-    if (nativeTableBlocks.length > 0) payload.attachments = [{ blocks: nativeTableBlocks.slice(0, 5) }];
-    return payload;
+    return {
+      text: response.slice(0, 200),
+      blocks: blocks.slice(0, 20),
+    };
   }
 
   return null;
+}
+
+function collapseFreshreleaseTables(response) {
+  const lines = String(response || "").split("\n");
+  const mergedRows = [];
+  let project = "";
+  let epicType = "";
+  let tableLines = [];
+
+  const flushTable = () => {
+    if (!project || tableLines.length === 0) {
+      tableLines = [];
+      return;
+    }
+    const parsed = parseMarkdownTable(tableLines.join("\n"));
+    tableLines = [];
+    if (!parsed) return;
+    for (const row of parsed.rows) {
+      mergedRows.push([project, epicType, ...row]);
+    }
+  };
+
+  for (const line of lines) {
+    if (/^##\s+/.test(line)) {
+      flushTable();
+      project = line.replace(/^##\s+/, "").trim();
+      epicType = "";
+      continue;
+    }
+    if (/^Epic type:\s+/i.test(line)) {
+      epicType = line.replace(/^Epic type:\s+/i, "").trim();
+      continue;
+    }
+    if (/^\|/.test(line.trim())) {
+      tableLines.push(line.trim());
+      continue;
+    }
+    if (tableLines.length > 0 && line.trim() === "") {
+      flushTable();
+      continue;
+    }
+  }
+  flushTable();
+
+  if (mergedRows.length === 0) return response;
+  const header = ["Project", "Epic Type", "Key", "Title", "Assigned User", "Current State", "Created Date", "Targeted Date", "Updated"];
+  const markdown = [
+    "Freshrelease results",
+    `| ${header.join(" | ")} |`,
+    `| ${header.map(() => "---").join(" | ")} |`,
+    ...mergedRows.map((row) => `| ${row.map((cell) => String(cell || "").replace(/\|/g, "/")).join(" | ")} |`),
+  ];
+  return markdown.join("\n");
 }
 
 // ── Pending runs tracker (survives bridge restarts) ──────────────
@@ -1470,6 +1931,8 @@ function buildSlackTablePayload(response) {
 // deliver completed results that were orphaned by the restart.
 
 const PENDING_RUNS_FILE = path.join(REPO_DIR, "persist", "pending-slack-runs.json");
+const PENDING_RUN_EXPIRE_MS = 20 * 60 * 1000;
+const PENDING_RUN_DROP_MS = 6 * 60 * 60 * 1000;
 
 function loadPendingRuns() {
   try { return JSON.parse(fs.readFileSync(PENDING_RUNS_FILE, "utf-8")); } catch { return {}; }
@@ -1491,16 +1954,46 @@ function removePendingRun(sessionId) {
   savePendingRuns(runs);
 }
 
+function getPendingRunAgeMs(info, now = Date.now()) {
+  return Math.max(0, now - Number(info?.startedAt || 0));
+}
+
+function shouldDropPendingRun(info, now = Date.now()) {
+  return getPendingRunAgeMs(info, now) > PENDING_RUN_DROP_MS;
+}
+
+function shouldExpirePendingRun(info, now = Date.now()) {
+  return getPendingRunAgeMs(info, now) > PENDING_RUN_EXPIRE_MS;
+}
+
 // On bridge startup: recover orphaned completed runs
 async function recoverOrphanedRuns(slackClient) {
   const runs = loadPendingRuns();
   const now = Date.now();
   let recovered = 0;
+  let expired = 0;
 
   for (const [sessionId, info] of Object.entries(runs)) {
-    // Skip runs older than 1 hour (stale)
-    if (now - info.startedAt > 3600000) {
+    if (shouldDropPendingRun(info, now)) {
       delete runs[sessionId];
+      continue;
+    }
+
+    if (shouldExpirePendingRun(info, now)) {
+      if (info.channel && info.thinkingTs) {
+        try {
+          await slackClient.chat.update({
+            token: SLACK_BOT_TOKEN,
+            channel: info.channel,
+            ts: info.thinkingTs,
+            text: "Previous run expired before completion. Send the request again to retry.",
+          });
+        } catch (err) {
+          console.error(`[recovery] Failed to mark expired run ${sessionId}: ${err.message}`);
+        }
+      }
+      delete runs[sessionId];
+      expired++;
       continue;
     }
 
@@ -1549,6 +2042,7 @@ async function recoverOrphanedRuns(slackClient) {
 
   savePendingRuns(runs);
   if (recovered > 0) console.log(`[recovery] Delivered ${recovered} orphaned result(s)`);
+  if (expired > 0) console.log(`[recovery] Expired ${expired} stale pending run(s)`);
 }
 
 // ── Run agent inside sandbox (fire-and-poll) ─────────────────────
@@ -1627,7 +2121,21 @@ function sshExec(confPath, sandboxName, cmd, timeoutMs = 30000) {
     }).trim();
   } catch (err) {
     if (err.stdout) return err.stdout.toString().trim();
-    throw err;
+    // Fall back to kubectl exec when SSH proxy is broken (e.g. after docker restart)
+    try {
+      return execFileSync("docker", [
+        "exec", "openshell-cluster-nemoclaw",
+        "kubectl", "exec", "-n", "openshell", sandboxName, "--",
+        "bash", "-c", `export HOME=/sandbox; ${cmd}`,
+      ], {
+        encoding: "utf-8",
+        timeout: timeoutMs,
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+    } catch (kubectlErr) {
+      if (kubectlErr.stdout) return kubectlErr.stdout.toString().trim();
+      throw err; // throw original SSH error
+    }
   }
 }
 
@@ -1723,6 +2231,62 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   } catch {}
   try { fs.unlinkSync(confPath); } catch {}
   return "Agent timed out after 30 minutes.";
+}
+
+async function runClaudeCodeInSandbox(message, sessionId, user) {
+  const sandboxName = user.sandboxName;
+  const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
+  dbg(`START-CLAUDE sandbox=${sandboxName} msg="${message.slice(0, 60)}..."`);
+
+  let sshConfig;
+  try {
+    sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
+  } catch (err) {
+    dbg(`FAIL ssh-config: ${err.message}`);
+    return `Error: Cannot reach sandbox '${sandboxName}'. Is it running?`;
+  }
+
+  const confPath = `/tmp/nemoclaw-slack-claude-${sessionId}.conf`;
+  fs.writeFileSync(confPath, sshConfig);
+
+  const tag = `slack-claude-${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const outFile = `/tmp/nemoclaw-agent-${tag}.out`;
+  const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
+  const command = buildClaudeCodeCommand(message, user);
+  const launchCmd = `( bash -lc '${command.replace(/'/g, "'\\''")}' ) > ${outFile} 2>&1; echo $? > ${rcFile}`;
+  try {
+    sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
+    dbg("LAUNCHED claude in sandbox");
+  } catch (err) {
+    dbg(`FAIL launch: ${err.message}`);
+    try { fs.unlinkSync(confPath); } catch {}
+    return `Error launching Claude Code: ${err.message}`;
+  }
+
+  const maxWaitMs = 3600000;
+  const pollIntervalMs = 3000;
+  const startTime = Date.now();
+  let pollCount = 0;
+  while (Date.now() - startTime < maxWaitMs) {
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    pollCount++;
+    try {
+      const rc = sshExec(confPath, sandboxName, `cat ${rcFile} 2>/dev/null || echo __pending__`, 10000);
+      if (rc === "__pending__") {
+        if (pollCount % 20 === 0) dbg(`CLAUDE POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
+        continue;
+      }
+      const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
+      sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
+      try { fs.unlinkSync(confPath); } catch {}
+      dbg(`CLAUDE DONE rc=${rc} bytes=${raw.length}`);
+      return filterAgentOutput(raw);
+    } catch (err) {
+      dbg(`CLAUDE poll failure: ${err.message}`);
+    }
+  }
+  try { fs.unlinkSync(confPath); } catch {}
+  return "Claude Code timed out before completing the task.";
 }
 
 // ── Main ──────────────────────────────────────────────────────────
@@ -1894,7 +2458,7 @@ async function main() {
       return;
     }
 
-    if (isAddClawCommand(text) || isDeleteClawCommand(text) || isConfirmDeleteClawCommand(text)) {
+    if (isAddClawCommand(text) || isPurgeClawCommand(text) || isDeleteClawCommand(text) || isConfirmDeleteClawCommand(text)) {
       if (!isDM) {
         await reply("Admin claw management commands must be sent as a direct message.");
         return;
@@ -1917,6 +2481,8 @@ async function main() {
 
       const result = isAddClawCommand(text)
         ? await handleAddClaw(user, text)
+        : isPurgeClawCommand(text)
+          ? await handlePurgeClaw(user, text)
         : isDeleteClawCommand(text)
           ? await handleDeleteClaw(user, text)
           : await handleConfirmDeleteClaw(user, text);
@@ -1932,6 +2498,11 @@ async function main() {
 
     if (isDM && user && isAdminUser(user) && looksLikeAdminCommand(text)) {
       await reply("Unknown admin command. Use `!admin-help`. Admin commands are handled directly and are not sent to the sandbox agent.");
+      return;
+    }
+
+    if (isDM && normalizeText(text).startsWith("!") && !isKnownBangCommand(text)) {
+      await reply("Unknown command.");
       return;
     }
 
@@ -2083,9 +2654,119 @@ async function main() {
     }
 
     const displayName = user.slackDisplayName || event.user;
-    console.log(`[${channel}] ${displayName} → ${user.sandboxName}: ${text}`);
+    const requestedRetry = isRetryCommand(text);
+    const priorUserRequest = getRecordedLastUserRequest(user.slackUserId);
+    let effectiveText = text;
+    if (requestedRetry && priorUserRequest) {
+      effectiveText = priorUserRequest;
+    }
+    if (!requestedRetry) {
+      recordLastUserRequest(user.slackUserId, text);
+    }
+    console.log(`[${channel}] ${displayName} → ${user.sandboxName}: ${effectiveText}`);
 
     try {
+      let freshreleaseEpicRequest = parseFreshreleaseEpicRequest(effectiveText);
+      let freshreleaseChildrenRequest = parseFreshreleaseChildrenRequest(effectiveText);
+      let freshreleaseIssueDetailRequest = parseFreshreleaseIssueDetailRequest(effectiveText);
+      if (requestedRetry && hasFreshreleaseCredentials(user)) {
+        const recorded = getRecordedFreshreleaseRequest(user.slackUserId);
+        if (recorded?.type === "epics") freshreleaseEpicRequest = recorded.request;
+        if (recorded?.type === "children") freshreleaseChildrenRequest = recorded.request;
+        if (recorded?.type === "issue") freshreleaseIssueDetailRequest = recorded.request;
+      }
+      if ((freshreleaseEpicRequest || freshreleaseChildrenRequest || freshreleaseIssueDetailRequest) && hasFreshreleaseCredentials(user)) {
+        const thinkingMsg = await app.client.chat.postMessage({
+          token: SLACK_BOT_TOKEN,
+          channel,
+          thread_ts: threadTs,
+          text: "Fetching Freshrelease data...",
+        });
+        try {
+          let response;
+          if (freshreleaseEpicRequest) {
+            recordFreshreleaseRequest(user.slackUserId, { type: "epics", request: freshreleaseEpicRequest });
+            response = runFreshreleaseHelper(user, freshreleaseEpicRequest.projects, {
+              FR_EPIC_LIMIT: String(freshreleaseEpicRequest.limit),
+              FR_STATUS_QUERY: freshreleaseEpicRequest.statusQuery || "",
+            });
+            response = collapseFreshreleaseTables(response);
+          } else if (freshreleaseChildrenRequest) {
+            recordFreshreleaseRequest(user.slackUserId, { type: "children", request: freshreleaseChildrenRequest });
+            response = runFreshreleaseHelper(user, ["--children", freshreleaseChildrenRequest.parentKey], {
+              FR_STATUS_QUERY: freshreleaseChildrenRequest.statusQuery || "",
+            });
+          } else {
+            recordFreshreleaseRequest(user.slackUserId, { type: "issue", request: freshreleaseIssueDetailRequest });
+            response = runFreshreleaseHelper(user, ["--issue", freshreleaseIssueDetailRequest.issueKey]);
+          }
+          response = redactSensitiveText(response, user);
+          const tablePayload = buildSlackTablePayload(response);
+          if (tablePayload) {
+            await app.client.chat.update({
+              token: SLACK_BOT_TOKEN,
+              channel,
+              ts: thinkingMsg.ts,
+              ...tablePayload,
+            });
+            return;
+          }
+          await app.client.chat.update({
+            token: SLACK_BOT_TOKEN,
+            channel,
+            ts: thinkingMsg.ts,
+            text: response.slice(0, 3800),
+          });
+        } catch (err) {
+          const detail = redactSensitiveText(`${err.stdout || ""}${err.stderr || ""}`.trim() || err.message, user);
+          await app.client.chat.update({
+            token: SLACK_BOT_TOKEN,
+            channel,
+            ts: thinkingMsg.ts,
+            text: `Freshrelease query failed: ${detail.slice(0, 800)}`,
+          });
+        }
+        return;
+      }
+
+      const googleRequest = parseGoogleRequest(effectiveText);
+      if (googleRequest && hasGoogleCredentials(user)) {
+        const thinkingMsg = await app.client.chat.postMessage({
+          token: SLACK_BOT_TOKEN,
+          channel,
+          thread_ts: threadTs,
+          text: "Fetching Google data...",
+        });
+        try {
+          const response = redactSensitiveText(runGoogleHelper(user, googleRequest), user);
+          const tablePayload = buildSlackTablePayload(response);
+          if (tablePayload) {
+            await app.client.chat.update({
+              token: SLACK_BOT_TOKEN,
+              channel,
+              ts: thinkingMsg.ts,
+              ...tablePayload,
+            });
+          } else {
+            await app.client.chat.update({
+              token: SLACK_BOT_TOKEN,
+              channel,
+              ts: thinkingMsg.ts,
+              text: response.slice(0, 3800),
+            });
+          }
+        } catch (err) {
+          const detail = redactSensitiveText(`${err.stdout || ""}${err.stderr || ""}`.trim() || err.message, user);
+          await app.client.chat.update({
+            token: SLACK_BOT_TOKEN,
+            channel,
+            ts: thinkingMsg.ts,
+            text: `Google query failed: ${detail.slice(0, 800)}`,
+          });
+        }
+        return;
+      }
+
       const thinkingMsg = await app.client.chat.postMessage({
         token: SLACK_BOT_TOKEN,
         channel,
@@ -2120,7 +2801,9 @@ async function main() {
 
         // Don't override the sandbox's configured primary model — it may be Ollama, not Anthropic
 
-        let result = await runAgentInSandbox(text, agentSessionId, user);
+        let result = shouldUseDirectClaudeCode(effectiveText)
+          ? await runClaudeCodeInSandbox(effectiveText, agentSessionId, user)
+          : await runAgentInSandbox(effectiveText, agentSessionId, user);
         console.log(`[${channel}] ${user.sandboxName} → ${displayName}: ${result.slice(0, 100)}...`);
 
         // On rate limit: trigger cooldown, attempt NVIDIA fallback immediately
@@ -2133,7 +2816,7 @@ async function main() {
             ts: thinkingMsg.ts,
             text: "Anthropic rate limited — trying NVIDIA Nemotron...",
           });
-          result = await attemptFallbackRouting(user, text, `${event.user}-${channel}-${Date.now()}`, channel, displayName);
+          result = await attemptFallbackRouting(user, effectiveText, `${event.user}-${channel}-${Date.now()}`, channel, displayName);
         }
 
         // On auth error: refresh credentials and retry once before giving up
@@ -2146,11 +2829,11 @@ async function main() {
             text: "Refreshing credentials, one moment...",
           });
           if (refreshCredentials(user.sandboxName, user.credentialsDir || "")) {
-            result = await runAgentInSandbox(text, `${event.user}-${channel}-${Date.now()}-retry`, user);
+            result = await runAgentInSandbox(effectiveText, `${event.user}-${channel}-${Date.now()}-retry`, user);
             console.log(`[${channel}] ${user.sandboxName} → ${displayName} (retry): ${result.slice(0, 100)}...`);
           }
           if (AUTH_ERROR_RE.test(result)) {
-            result = await attemptFallbackRouting(user, text, `${event.user}-${channel}-${Date.now()}`, channel, displayName);
+            result = await attemptFallbackRouting(user, effectiveText, `${event.user}-${channel}-${Date.now()}`, channel, displayName);
           }
         }
         return result;
@@ -2164,6 +2847,7 @@ async function main() {
       }
 
       // Convert markdown to Slack format, then build table blocks
+      response = redactSensitiveText(response, user);
       response = mdToSlack(mdLinksToSlack(response));
       const tablePayload = buildSlackTablePayload(response);
       if (tablePayload) {
@@ -2239,8 +2923,10 @@ module.exports = {
   canonicalizeAdminCommand,
   looksLikeAdminCommand,
   isAddClawCommand,
+  isPurgeClawCommand,
   isDeleteClawCommand,
   isConfirmDeleteClawCommand,
+  isKnownBangCommand,
   parseSandboxList,
   formatDurationFrom,
   getInventoryStatus,
@@ -2249,6 +2935,27 @@ module.exports = {
   parseShowClawsOptions,
   filterAndSortClawInventory,
   formatClawInventory,
+  parseFreshreleaseEpicRequest,
+  parseFreshreleaseChildrenRequest,
+  parseFreshreleaseIssueDetailRequest,
+  parseFreshreleaseStatusQuery,
+  extractFreshreleaseProjects,
+  isRetryCommand,
+  hasFreshreleaseCredentials,
+  hasGoogleCredentials,
+  parseGoogleRequest,
+  runFreshreleaseEpicHelper,
+  runFreshreleaseHelper,
+  runGoogleHelper,
+  collapseFreshreleaseTables,
+  redactSensitiveText,
+  recordLastUserRequest,
+  getRecordedLastUserRequest,
+  getPendingRunAgeMs,
+  shouldExpirePendingRun,
+  shouldDropPendingRun,
+  shouldUseDirectClaudeCode,
+  buildClaudeCodeCommand,
   buildShowClawsPayload,
   buildShowClawsTablePayload,
   buildShowClawsTablePayloadFromInventory,

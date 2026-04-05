@@ -1,0 +1,41 @@
+{
+  "sandbox": {
+    "createTimeoutMs": 300000,
+    "readyTimeoutMs": 180000,
+    "readyPollMs": 5000,
+    "postCreateRecoveryTimeoutMs": 90000
+  },
+  "reconcile": {
+    "injectTimeoutMs": 120000
+  },
+  "resilience": {
+    "devtoolsTimeoutSeconds": 90
+  },
+  "policies": {
+    "defaultPresets": ["npm", "pypi", "slack"],
+    "conditionalPresets": [
+      { "preset": "freshworks", "credential": "freshrelease-api-key.txt" }
+    ]
+  },
+  "workspace": {
+    "sharedDefaultsDir": "persist/workspace",
+    "sharedFiles": [
+      "SOUL.md",
+      "IDENTITY.md",
+      "USER.md",
+      "TOOLS.md",
+      "HEARTBEAT.md",
+      "AGENTS.md",
+      "BOOTSTRAP.md"
+    ]
+  },
+  "tools": {
+    "priorityOrder": [
+      "Direct APIs",
+      "Native CLIs",
+      "Local helper scripts",
+      "Skills or plugins",
+      "Claude Code for real coding tasks"
+    ]
+  }
+}

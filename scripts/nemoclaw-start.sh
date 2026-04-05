@@ -351,6 +351,8 @@ update_anthropic_apikey_in_config() {
   python3 - <<'PYPATCH'
 import json, os
 path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path) or not os.access(path, os.W_OK):
+    raise SystemExit(0)
 try:
     cfg = json.load(open(path))
 except Exception:
