@@ -19,7 +19,7 @@ The last reliability fixes in this pass were:
 ## Architecture
 
 <p align="center">
-  <img src="docs/multi-user-architecture.svg" alt="Codex-managed multi-user NemoClaw architecture" width="100%" />
+  <img src="docs/multi-user-architecture-codex.svg" alt="Codex-managed multi-user NemoClaw architecture" width="100%" />
 </p>
 
 <details>
