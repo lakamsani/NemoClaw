@@ -300,6 +300,11 @@ path = os.path.expanduser('~/.openclaw/openclaw.json')
 if not os.path.exists(path) or not os.access(path, os.W_OK): exit(0)
 cfg = json.load(open(path))
 cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = '${PRIMARY_MODEL}'
+# If primary is nvidia, fix baseUrl (baked image has inference.local which is circular)
+if 'nvidia' in '${PRIMARY_MODEL}':
+    nv = cfg.get('models', {}).get('providers', {}).get('nvidia', {})
+    if nv.get('baseUrl', '') == 'https://inference.local/v1':
+        nv['baseUrl'] = 'https://integrate.api.nvidia.com/v1'
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
 \"" 2>/dev/null
