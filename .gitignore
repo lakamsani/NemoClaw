@@ -45,3 +45,20 @@ secrets.json
 secrets.yaml
 service-account*.json
 token.json
+
+# Local scratch / agent state
+.claude/settings.json
+.entire/
+.remember/
+nohup.out
+
+# Live multi-user runtime state (never commit)
+persist/audit/
+persist/gateway/
+persist/migration/
+persist/pending-slack-runs.json
+persist/users/
+
+# Local packages / binaries fetched during debugging or runtime
+persist/packages/
+persist/xurl-*
