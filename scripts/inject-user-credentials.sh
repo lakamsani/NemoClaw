@@ -270,5 +270,22 @@ BASHRC
 chmod 644 /sandbox/.bashrc'
 info "Shell profile created"
 
+# ── Per-user primary inference model ───────────────────────────────
+if [ -f "$CRED_DIR/primary-model.txt" ]; then
+  PRIMARY_MODEL="$(cat "$CRED_DIR/primary-model.txt" | tr -d '[:space:]')"
+  if [ -n "$PRIMARY_MODEL" ]; then
+    ssh_cmd "python3 -c \"
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path) or not os.access(path, os.W_OK): exit(0)
+cfg = json.load(open(path))
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = '${PRIMARY_MODEL}'
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+\"" 2>/dev/null
+    info "Primary model set to ${PRIMARY_MODEL}"
+  fi
+fi
+
 echo ""
 info "Credential injection complete for sandbox '${SANDBOX}'"
