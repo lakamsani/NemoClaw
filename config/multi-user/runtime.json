@@ -27,8 +27,6 @@
       "TOOLS.md",
       "HEARTBEAT.md",
       "AGENTS.md",
-      "session-artifacts.json",
-      "scripts/session_artifacts.py",
       "BOOTSTRAP.md"
     ]
   },

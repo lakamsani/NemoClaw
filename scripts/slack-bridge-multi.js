@@ -48,7 +48,7 @@ const REPO_DIR = require("path").resolve(__dirname, "..");
 const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication|401.*auth|expired.*token|OAuth token has expired/i;
 const RATE_LIMIT_RE = /rate.limit|429|too many requests|overloaded|capacity/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
-const DEFAULT_STARTUP_STALL_MS = 180000;
+const DEFAULT_STARTUP_STALL_MS = 300000;
 const STARTUP_STALL_MS = Number.parseInt(process.env.NEMOCLAW_STARTUP_STALL_MS || "", 10) || DEFAULT_STARTUP_STALL_MS;
 const pendingDeleteRequests = new Map();
 const lastEmailRequests = new Map();
@@ -328,6 +328,30 @@ function sanitizeUserFacingResponse(text) {
     return buildFriendlyFailure("sandbox", raw);
   }
   return raw;
+}
+
+function extractFinalResponseBlock(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+
+  const markerPatterns = [
+    /^\*?PR:\s*https:\/\/github\.com\/\S+/gim,
+    /^PR (?:is open|created|merged)\b.*$/gim,
+    /^Issue #\d+:\s*https:\/\/github\.com\/\S+/gim,
+    /^Issue #\d+\s+closed:\s*https:\/\/github\.com\/\S+/gim,
+    /^Done\.\s*(?:Here'?s|What was done|PR\b).*/gim,
+    /^Execution summary:.*$/gim,
+  ];
+
+  let start = -1;
+  for (const pattern of markerPatterns) {
+    for (const match of raw.matchAll(pattern)) {
+      if (typeof match.index === "number" && match.index > start) start = match.index;
+    }
+  }
+
+  if (start <= 0) return raw;
+  return raw.slice(start).trim();
 }
 
 function isRetryCommand(text) {
@@ -1279,10 +1303,7 @@ function buildAgentCommand(message, sessionId, user, options = {}) {
     setupLines.push("export NEMOCLAW_SKIP_CLAUDE_AUTH=1");
   }
   const scriptLines = [...setupLines];
-  // Clean stale session locks before running (zombie openclaw-agent processes leave orphan locks)
-  scriptLines.push(`find /sandbox/.openclaw/agents -name '*.lock' -mmin +2 -delete 2>/dev/null || true`);
-  scriptLines.push(`NEMOCLAW_START_BIN=/usr/local/bin/nemoclaw-start; [ -x /sandbox/bin/nemoclaw-start ] && NEMOCLAW_START_BIN=/sandbox/bin/nemoclaw-start`);
-  scriptLines.push(`"$NEMOCLAW_START_BIN" openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
+  scriptLines.push(`openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
   return scriptLines.join("\n");
 }
 
@@ -1991,7 +2012,7 @@ function filterAgentOutput(raw) {
     .replace(/^---\s*$/gm, "");
 
   // Second pass: line-by-line filter
-  return cleaned.split("\n").filter(
+  const filtered = cleaned.split("\n").filter(
     (l) =>
       !l.startsWith("Setting up NemoClaw") &&
       !l.startsWith("[plugins]") &&
@@ -2030,6 +2051,8 @@ function filterAgentOutput(raw) {
       !l.includes("\u2514\u2500") &&
       l.trim() !== "",
   ).join("\n").trim();
+
+  return extractFinalResponseBlock(filtered);
 }
 
 function sshExec(confPath, sandboxName, cmd, timeoutMs = 30000) {
@@ -2069,40 +2092,6 @@ function getRemoteFileStat(confPath, sandboxName, filePath) {
   return { size, mtimeMs };
 }
 
-function readSessionArtifacts(confPath, sandboxName) {
-  try {
-    const raw = sshExec(
-      confPath,
-      sandboxName,
-      "cat /sandbox/.openclaw-data/workspace/session-artifacts.json 2>/dev/null || echo __missing__",
-      10000,
-    );
-    if (!raw || raw === "__missing__") return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function buildArtifactRecoveryResponse(before, after) {
-  if (!after || typeof after !== "object") return "";
-  const beforePrUrl = before?.pull_request?.url || "";
-  const afterPrUrl = after?.pull_request?.url || "";
-  if (afterPrUrl && afterPrUrl !== beforePrUrl) {
-    const prNumber = after?.pull_request?.number ? `#${after.pull_request.number}` : "created";
-    return `PR ${prNumber}: ${afterPrUrl}`;
-  }
-
-  const beforeIssueUrl = before?.issue?.url || "";
-  const afterIssueUrl = after?.issue?.url || "";
-  if (afterIssueUrl && afterIssueUrl !== beforeIssueUrl) {
-    const issueNumber = after?.issue?.number ? `#${after.issue.number}` : "created";
-    return `Issue ${issueNumber}: ${afterIssueUrl}`;
-  }
-
-  return "";
-}
-
 async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const sandboxName = user.sandboxName;
   const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
@@ -2123,7 +2112,6 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const tag = `slack-${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
   const outFile = `/tmp/nemoclaw-agent-${tag}.out`;
   const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
-  const artifactBefore = readSessionArtifacts(confPath, sandboxName);
 
   const agentCmd = buildAgentCommand(message, sessionId, user, options);
 
@@ -2172,15 +2160,14 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
         }
         if (currentStat && Date.now() - lastOutputProgressAt >= STARTUP_STALL_MS) {
           const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
+          if (/session file locked/i.test(raw)) {
+            dbg("LOCK timeout detected while waiting for startup output");
+            sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
+            try { fs.unlinkSync(confPath); } catch {}
+            return buildFriendlyFailure("sandbox", raw);
+          }
           const partial = filterAgentOutput(raw);
           if (!partial) {
-            const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
-            if (recovered) {
-              dbg(`RECOVERED from artifacts on stall: "${recovered}"`);
-              sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
-              try { fs.unlinkSync(confPath); } catch {}
-              return recovered;
-            }
             dbg(`STALL no progress for ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s (elapsed ${Math.round((Date.now() - startTime) / 1000)}s)`);
             sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
             try { fs.unlinkSync(confPath); } catch {}
@@ -2206,11 +2193,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       const response = filterAgentOutput(raw);
       dbg(`FILTERED response: ${response.length} bytes, first 80: "${response.slice(0, 80)}"`);
       if (response) return response;
-      const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
-      if (recovered) {
-        dbg(`RECOVERED from artifacts after rc=${rc}: "${recovered}"`);
-        return recovered;
-      }
+      if (/session file locked/i.test(raw)) return buildFriendlyFailure("sandbox", raw);
       if (rc !== "0") return buildFriendlyFailure("sandbox", raw);
       return "(no response)";
     } catch (err) {
@@ -2232,14 +2215,10 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
     const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 10000);
     sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
     try { fs.unlinkSync(confPath); } catch {}
+    if (/session file locked/i.test(raw)) return buildFriendlyFailure("sandbox", raw);
     const partial = filterAgentOutput(raw);
     dbg(`TIMEOUT partial: ${partial.length} bytes`);
     if (partial) return partial + "\n\n_(timed out after 30 minutes)_";
-    const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
-    if (recovered) {
-      dbg(`RECOVERED from artifacts on timeout: "${recovered}"`);
-      return recovered;
-    }
   } catch {}
   try { fs.unlinkSync(confPath); } catch {}
   return buildFriendlyFailure("sandbox", "timed out");
@@ -2828,6 +2807,7 @@ module.exports = {
   runYahooHelper,
   collapseFreshreleaseTables,
   redactSensitiveText,
+  filterAgentOutput,
   sanitizeUserFacingResponse,
   recordLastUserRequest,
   getRecordedLastUserRequest,
@@ -2851,5 +2831,6 @@ module.exports = {
   describeClaudeCredentialSource,
   buildAuthRecoveryMessage,
   buildAgentCommand,
+  runAgentInSandbox,
   getRuntimeFallbackModels,
 };

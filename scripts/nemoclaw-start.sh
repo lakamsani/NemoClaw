@@ -31,6 +31,9 @@ fi
 # SECURITY: Lock down PATH so the agent cannot inject malicious binaries
 # into commands executed by the entrypoint or auto-pair watcher.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -x /sandbox/.local/go/bin/go ]; then
+  export PATH="/sandbox/.local/go/bin:$PATH"
+fi
 
 # ── Drop unnecessary Linux capabilities ──────────────────────────
 # CIS Docker Benchmark 5.3: containers should not run with default caps.
@@ -369,7 +372,9 @@ except Exception:
 providers = cfg.setdefault('models', {}).setdefault('providers', {})
 if 'anthropic' in providers:
     providers['anthropic']['apiKey'] = os.environ['ANTHROPIC_API_KEY']
-cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
+model_cfg = cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
+if not model_cfg.get('primary'):
+    model_cfg['primary'] = 'anthropic/claude-sonnet-4-6'
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
 PYPATCH

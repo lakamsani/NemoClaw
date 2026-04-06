@@ -111,6 +111,25 @@ describe("slack-bridge-multi helpers", () => {
     expect(cmd).toContain("User request: open a PR after tests pass");
   });
 
+  it("keeps only the final completion block from long coding transcripts", () => {
+    const raw = `
+Now let me fetch the issue details and start the fix.
+No GH_TOKEN configured in skills. Let me check...
+gh CLI is available and authenticated. Let me fetch the issue:
+Now commit and push:
+PR is open at https://github.com/lakamsani/fare-finder/pull/16. Let me check if the CI triggered:
+All tests pass :white_check_mark:
+Done. Here's what was done to fix issue #14:
+*PR: https://github.com/lakamsani/fare-finder/pull/16*
+Added a full Go port under go/.
+`;
+
+    expect(bridge.filterAgentOutput(raw)).toBe([
+      "*PR: https://github.com/lakamsani/fare-finder/pull/16*",
+      "Added a full Go port under go/.",
+    ].join("\n"));
+  });
+
   it("parses generic email requests for Yahoo helper routing", () => {
     expect(bridge.parseYahooRequest("get pending personal tasks")).toBeNull();
     expect(bridge.parseYahooRequest("emails from my cpa")).toEqual({
