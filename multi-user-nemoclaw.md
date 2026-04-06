@@ -4,9 +4,9 @@
 
 This deployment runs one claw per user inside isolated OpenShell sandboxes and exposes them primarily through Slack, with WhatsApp and host-side mail helpers where sandbox egress is not a good fit.
 
-The current baseline is Codex-managed. The bridge owns Slack routing, admin commands, self-service credential setup, per-user queueing, pending-run recovery, and inference fallback. The sandbox fleet owns user workspace state, in-sandbox tools such as `gog` and Freshrelease MCP, and foreground coding work through Claude Code.
+The current baseline is Anthropic-managed. The bridge owns Slack routing, admin commands, self-service credential setup, per-user queueing, pending-run recovery, and response filtering. The sandbox fleet owns user workspace state, in-sandbox tools such as `gog` and Freshrelease MCP, and foreground coding work through the default OpenClaw `main` agent.
 
-**Current status:** the multi-user runtime has moved past the initial recovery phase. The active shape of the system is a DM-only Slack bridge with direct admin commands, shared runtime policy in repo config, per-user credential injection, recoverable add/delete flows, and explicit fallback routing when Anthropic auth or rate limits fail.
+**Current status:** the active shape of the system is a DM-only Slack bridge with direct admin commands, shared runtime policy in repo config, per-user credential injection, recoverable add/delete flows, and a simplified Slack execution path that launches the sandbox `main` agent directly.
 
 ---
 
@@ -36,7 +36,7 @@ Slack bridge / WhatsApp bridge  ── per-user queue ── pending-run recover
           ├── one sandbox per user
           ├── shared workspace defaults + per-user credentials
           ├── in-sandbox Freshrelease MCP and Google gog access
-          └── Claude Code foreground path for coding tasks
+          └── foreground coding work through the sandbox main agent
 
 Shared control files:
   ~/.nemoclaw/users.json
@@ -56,7 +56,7 @@ Shared control files:
 - Pending Slack runs persist to disk and expire cleanly on restart.
 - Admin commands are handled directly on the host, not by the sandbox agent.
 - Shared runtime behavior comes from repo config instead of prompt drift.
-- Claude Code is used directly for coding tasks and kept in the foreground.
+- Coding work stays in the foreground through the sandbox `main` agent.
 
 ---
 
@@ -104,13 +104,13 @@ The shared tool order is:
 | 2 | Native CLIs | GitHub, git, language tools, sandbox commands |
 | 3 | Local helper scripts | Deterministic wrappers for repetitive or brittle host flows |
 | 4 | Skills or plugins | Structured workflows where needed |
-| 5 | Claude Code | Coding, migrations, testing, commits, PRs |
+| 5 | OpenClaw main agent | Coding, migrations, testing, commits, PRs |
 
 ### Current Practical Usage
 
 | Capability | Current path |
 |------------|--------------|
-| Coding and repo work | Direct Claude Code inside the sandbox, foreground only |
+| Coding and repo work | Direct OpenClaw `main` agent inside the sandbox, foreground only |
 | Freshrelease | In-sandbox Freshrelease MCP via `mcporter` |
 | Google tasks and calendar | In-sandbox `gog` |
 | Yahoo mail and email triage | Host-side `email-query.py` and `yahoo-mail.py` |
@@ -119,7 +119,7 @@ The shared tool order is:
 
 ### Inference Routing
 
-The steady-state preference is still Anthropic for Claude-authenticated runs, but the bridge now owns fallback routing when that path is unavailable.
+The steady-state preference is Anthropic for normal Slack runs through the sandbox `main` agent, with bridge-owned fallback routing available when that path is unavailable.
 
 Current behavior:
 
@@ -129,7 +129,7 @@ Current behavior:
 - after a fallback run, the bridge restores the sandbox primary model
 - selection metadata is synced into the sandbox so the user-visible runtime stays aligned with the active provider route
 
-The route metadata defaults to NVIDIA-managed inference settings, while per-user Claude setup resets the sandbox primary model back to Anthropic for normal runs.
+Per-user Claude setup resets the sandbox primary model back to Anthropic for normal runs.
 
 ---
 
@@ -195,7 +195,7 @@ Slack is the main operator and user interface.
 Validated or implemented capabilities in the current bridge include:
 
 - normal claw prompts
-- coding and repo tasks through direct Claude Code routing
+- coding and repo tasks through the foreground sandbox `main` agent
 - Freshrelease and Google requests through in-sandbox tools
 - natural-language Yahoo inbox and search queries
 - direct `!yahoo` mail actions
