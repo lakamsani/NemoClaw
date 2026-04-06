@@ -34,6 +34,7 @@ const DEFAULT_RUNTIME_CONFIG = {
       "TOOLS.md",
       "HEARTBEAT.md",
       "AGENTS.md",
+      "session-artifacts.json",
       "BOOTSTRAP.md",
     ],
   },

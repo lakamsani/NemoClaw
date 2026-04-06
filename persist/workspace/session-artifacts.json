@@ -1,0 +1,20 @@
+{
+  "updated_at": null,
+  "repo": null,
+  "issue": {
+    "number": null,
+    "url": null,
+    "status": null
+  },
+  "branch": {
+    "name": null
+  },
+  "commit": {
+    "sha": null
+  },
+  "pull_request": {
+    "number": null,
+    "url": null,
+    "status": null
+  }
+}

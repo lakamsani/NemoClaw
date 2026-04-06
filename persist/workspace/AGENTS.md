@@ -55,6 +55,17 @@ You're a participant, not the user's proxy. Reply when you add value. Stay quiet
 
 Skills provide specialized workflows. Use `TOOLS.md` for tool preferences and local operational rules.
 
+## GitHub Continuity
+
+For GitHub issue, branch, commit, pull request, merge, and close workflows:
+
+- Maintain `session-artifacts.json` in this workspace as the session-local task record.
+- Update it after identifying the repo or issue, creating or switching branches, pushing commits, opening PRs, merging PRs, and closing issues.
+- Store only concrete execution artifacts there: repo, issue number and URL, branch, latest pushed commit SHA, PR number and URL, statuses, and `updated_at`.
+- Before asking what `that PR`, `the issue`, `it`, or `that branch` refers to, first resolve it from the recent conversation, `session-artifacts.json`, local git state, and GitHub CLI state if available.
+- Ask for clarification only when multiple plausible targets exist, the artifact file is missing, the artifact conflicts with current repo state, or the user is clearly switching tasks.
+- End GitHub task responses with a compact execution summary containing repo, issue, PR, branch, and status.
+
 ## Heartbeats
 
 When a heartbeat poll arrives, read `HEARTBEAT.md` and follow it. If nothing needs attention, reply `HEARTBEAT_OK`.

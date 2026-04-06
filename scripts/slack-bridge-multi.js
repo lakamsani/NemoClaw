@@ -613,14 +613,6 @@ function requestLikelyNeedsMcp(text) {
   return /\bfreshrelease\b|\bmcp\b|\bepic\b|\bissue\b|\bstory\b|\bticket\b|\btask\b|\bsprint\b|\bbacklog\b|\bboard\b|\bassigned\b|\bcalendar\b|\bevent\b|\bmeeting\b|\bgmail\b|\bemail\b|\binbox\b|\bgoogle\b|\bdocs\b|\bdrive\b/i.test(String(text || ""));
 }
 
-function shouldUseDirectClaudeCode(text) {
-  const normalized = normalizeText(text);
-  const hasRepoOrCodeTarget = /\b(repo|repository|pull request|pr\b|branch\b|commit\b|java\b|gradle\b|maven\b|go\b|typescript\b|python\b|test\b|tests\b)\b/i.test(normalized);
-  const hasCodingAction = /\b(migrate|refactor|implement|fix|port|convert|rewrite|create|open|send|raise|submit|run)\b/i.test(normalized);
-  const excludes = /\b(freshrelease|gmail|calendar|yahoo|whatsapp|email|epic|story|issue|ticket)\b/i.test(normalized);
-  return hasRepoOrCodeTarget && hasCodingAction && !excludes;
-}
-
 function listConfiguredCredentials(user) {
   if (!user?.credentialsDir) return [];
   const credDir = path.isAbsolute(user.credentialsDir)
@@ -1289,33 +1281,6 @@ function buildAgentCommand(message, sessionId, user, options = {}) {
   scriptLines.push(`find /sandbox/.openclaw/agents -name '*.lock' -mmin +2 -delete 2>/dev/null || true`);
   scriptLines.push(`nemoclaw-start openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
   return scriptLines.join("\n");
-}
-
-function buildClaudeCodeCommand(message, user) {
-  const claudePrompt = [
-    "Slack execution rules:",
-    "- Stay in the foreground until the requested work is complete or you hit a concrete blocker.",
-    "- Do not spawn detached or background jobs.",
-    "- If tests are requested, run them and include the result.",
-    "- If a PR is requested, only open it after tests pass and return the clickable PR URL.",
-    "- If blocked, say exactly what failed and what evidence you gathered.",
-    "- For repository tasks, do not guess repo names or claim the repo is missing until you have checked with gh.",
-    "- If the prompt names a repo, first try an exact lookup with the configured GitHub user and that repo name, e.g. gh repo view <user>/<repo-from-prompt>.",
-    "- If the prompt does not name a repo, or the exact lookup fails, use gh to list/search candidate repositories for the configured GitHub user before asking for a repo URL.",
-    "- Prefer the configured GitHub user and the active gh account over Slack display name or other inferred identities.",
-    "",
-    `Slack user: ${user.slackDisplayName || user.slackUserId}`,
-    `GitHub user: ${user.githubUser || "unknown"}`,
-    `Task: ${message}`,
-  ].join("\n");
-  return [
-    "set -a; . /sandbox/.env; set +a",
-    "cd /sandbox/.openclaw-data/workspace",
-    "export HOME=/sandbox",
-    "export PATH=/usr/local/bin:/usr/bin:/bin:$PATH",
-    `export NEMOCLAW_GITHUB_USER='${sh(user.githubUser || "")}'`,
-    `timeout 3600 claude --permission-mode bypassPermissions --print '${claudePrompt.replace(/'/g, "'\\''")}'`,
-  ].join("\n");
 }
 
 function syncSandboxSelectionConfig(user, provider, model) {
@@ -2091,6 +2056,16 @@ function sshExec(confPath, sandboxName, cmd, timeoutMs = 30000) {
   }
 }
 
+function getRemoteFileStat(confPath, sandboxName, filePath) {
+  const raw = sshExec(confPath, sandboxName, `stat -c '%s %Y' ${filePath} 2>/dev/null || echo __missing__`, 10000);
+  if (!raw || raw === "__missing__") return null;
+  const [sizeText, mtimeText] = raw.trim().split(/\s+/);
+  const size = Number.parseInt(sizeText, 10);
+  const mtimeMs = Number.parseInt(mtimeText, 10) * 1000;
+  if (!Number.isFinite(size) || !Number.isFinite(mtimeMs)) return null;
+  return { size, mtimeMs };
+}
+
 async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const sandboxName = user.sandboxName;
   const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
@@ -2132,6 +2107,9 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const startTime = Date.now();
   let consecutiveFailures = 0;
   let pollCount = 0;
+  let lastOutputStat = null;
+  let lastOutputProgressAt = startTime;
+  const startupStallMs = 60000;
 
   while (Date.now() - startTime < maxWaitMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
@@ -2140,6 +2118,23 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       const rc = sshExec(confPath, sandboxName, `cat ${rcFile} 2>/dev/null || echo __pending__`, 10000);
       consecutiveFailures = 0;
       if (rc === "__pending__") {
+        const currentStat = getRemoteFileStat(confPath, sandboxName, outFile);
+        if (currentStat && (!lastOutputStat
+          || currentStat.size !== lastOutputStat.size
+          || currentStat.mtimeMs !== lastOutputStat.mtimeMs)) {
+          lastOutputProgressAt = Date.now();
+          lastOutputStat = currentStat;
+        }
+        if (currentStat && Date.now() - lastOutputProgressAt >= startupStallMs) {
+          const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
+          const partial = filterAgentOutput(raw);
+          if (!partial) {
+            dbg(`STALL no progress for ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s`);
+            sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
+            try { fs.unlinkSync(confPath); } catch {}
+            return buildFriendlyFailure("sandbox", "startup stalled before producing a response");
+          }
+        }
         if (pollCount % 20 === 0) dbg(`POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
         continue;
       }
@@ -2182,63 +2177,6 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
     dbg(`TIMEOUT partial: ${partial.length} bytes`);
     if (partial) return partial + "\n\n_(timed out after 30 minutes)_";
   } catch {}
-  try { fs.unlinkSync(confPath); } catch {}
-  return buildFriendlyFailure("sandbox", "timed out");
-}
-
-async function runClaudeCodeInSandbox(message, sessionId, user) {
-  const sandboxName = user.sandboxName;
-  const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
-  dbg(`START-CLAUDE sandbox=${sandboxName} msg="${message.slice(0, 60)}..."`);
-
-  let sshConfig;
-  try {
-    sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
-  } catch (err) {
-    dbg(`FAIL ssh-config: ${err.message}`);
-    return buildFriendlyFailure("sandbox", `Cannot reach sandbox '${sandboxName}'`);
-  }
-
-  const confPath = `/tmp/nemoclaw-slack-claude-${sessionId}.conf`;
-  fs.writeFileSync(confPath, sshConfig);
-
-  const tag = `slack-claude-${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const outFile = `/tmp/nemoclaw-agent-${tag}.out`;
-  const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
-  const command = buildClaudeCodeCommand(message, user);
-  const launchCmd = `( bash -lc '${command.replace(/'/g, "'\\''")}' ) > ${outFile} 2>&1; echo $? > ${rcFile}`;
-  try {
-    sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
-    updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
-    dbg("LAUNCHED claude in sandbox");
-  } catch (err) {
-    dbg(`FAIL launch: ${err.message}`);
-    try { fs.unlinkSync(confPath); } catch {}
-    return buildFriendlyFailure("sandbox", `Error launching Claude Code: ${err.message}`);
-  }
-
-  const maxWaitMs = 3600000;
-  const pollIntervalMs = 3000;
-  const startTime = Date.now();
-  let pollCount = 0;
-  while (Date.now() - startTime < maxWaitMs) {
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
-    pollCount++;
-    try {
-      const rc = sshExec(confPath, sandboxName, `cat ${rcFile} 2>/dev/null || echo __pending__`, 10000);
-      if (rc === "__pending__") {
-        if (pollCount % 20 === 0) dbg(`CLAUDE POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
-        continue;
-      }
-      const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
-      sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
-      try { fs.unlinkSync(confPath); } catch {}
-      dbg(`CLAUDE DONE rc=${rc} bytes=${raw.length}`);
-      return sanitizeUserFacingResponse(filterAgentOutput(raw) || (rc !== "0" ? raw : ""));
-    } catch (err) {
-      dbg(`CLAUDE poll failure: ${err.message}`);
-    }
-  }
   try { fs.unlinkSync(confPath); } catch {}
   return buildFriendlyFailure("sandbox", "timed out");
 }
@@ -2686,9 +2624,7 @@ async function main() {
 
         // Don't override the sandbox's configured primary model — it may be Ollama, not Anthropic
 
-        let result = shouldUseDirectClaudeCode(effectiveText)
-          ? await runClaudeCodeInSandbox(effectiveText, agentSessionId, user)
-          : await runAgentInSandbox(effectiveText, agentSessionId, user);
+        let result = await runAgentInSandbox(effectiveText, agentSessionId, user);
         console.log(`[${channel}] ${user.sandboxName} → ${displayName}: ${result.slice(0, 100)}...`);
 
         // On rate limit: trigger cooldown, attempt NVIDIA fallback immediately
@@ -2835,8 +2771,6 @@ module.exports = {
   shouldExpireLaunchingPendingRun,
   shouldExpirePendingRun,
   shouldDropPendingRun,
-  shouldUseDirectClaudeCode,
-  buildClaudeCodeCommand,
   buildShowClawsPayload,
   buildShowClawsTablePayload,
   buildShowClawsTablePayloadFromInventory,

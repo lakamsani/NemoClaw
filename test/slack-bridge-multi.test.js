@@ -111,25 +111,6 @@ describe("slack-bridge-multi helpers", () => {
     expect(cmd).toContain("User request: open a PR after tests pass");
   });
 
-  it("detects coding tasks that should go straight to Claude Code", () => {
-    expect(bridge.shouldUseDirectClaudeCode("migrate fare-finder git repo from go to java, run tests and send a PR")).toBe(true);
-    expect(bridge.shouldUseDirectClaudeCode("fix the build in this repository and open a PR")).toBe(true);
-    expect(bridge.shouldUseDirectClaudeCode("get 3 most active EPICs from BILLING")).toBe(false);
-    expect(bridge.shouldUseDirectClaudeCode("list my personal tasks on google calendar")).toBe(false);
-  });
-
-  it("tells direct Claude Code runs to resolve repos generically with gh", () => {
-    const cmd = bridge.buildClaudeCodeCommand("migrate fare-finder git repo from go to java", {
-      slackUserId: "U1",
-      slackDisplayName: "Alice",
-      githubUser: "alicehub",
-      roles: ["user"],
-    });
-    expect(cmd).toContain("If the prompt names a repo, first try an exact lookup");
-    expect(cmd).toContain("GitHub user: alicehub");
-    expect(cmd).toContain("export NEMOCLAW_GITHUB_USER='alicehub'");
-  });
-
   it("parses generic email requests for Yahoo helper routing", () => {
     expect(bridge.parseYahooRequest("get pending personal tasks")).toBeNull();
     expect(bridge.parseYahooRequest("emails from my cpa")).toEqual({
