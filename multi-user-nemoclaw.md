@@ -2,17 +2,11 @@
 
 ## Overview
 
-This deployment runs one claw per user inside isolated OpenShell sandboxes and exposes them primarily through Slack, with WhatsApp and host-side notification integrations where needed.
+This deployment runs one claw per user inside isolated OpenShell sandboxes and exposes them primarily through Slack, with WhatsApp and host-side mail helpers where sandbox egress is not a good fit.
 
-The old Claude-managed setup was unstable because too much behavior lived in drifting prompts, cron reinjection, and flaky bridge-to-agent delegation. The current Codex-managed baseline moves the system toward deterministic helpers, shared runtime config, recoverable provisioning, and explicit migration tooling.
+The current baseline is Codex-managed. The bridge owns Slack routing, admin commands, self-service credential setup, per-user queueing, pending-run recovery, and inference fallback. The sandbox fleet owns user workspace state, in-sandbox tools such as `gog` and Freshrelease MCP, and foreground coding work through Claude Code.
 
-**Current status:** Codex-managed recovery baseline is in place. Active claws were rebuilt, Slack developer experience was sanity-tested, and the main remaining validation is Slack-side admin command testing.
-
-The last reliability fixes in this pass were:
-
-- hardened Freshrelease helper retries and project resolution for natural-language project names such as `email` and `search`
-- hardened Google `gog` helper binary resolution so daemon PATH drift does not break host-side Google queries
-- documented the currently working OpenClaw admin UI access path through Kubernetes port-forward plus a second SSH hop from a laptop browser
+**Current status:** the multi-user runtime has moved past the initial recovery phase. The active shape of the system is a DM-only Slack bridge with direct admin commands, shared runtime policy in repo config, per-user credential injection, recoverable add/delete flows, and explicit fallback routing when Anthropic auth or rate limits fail.
 
 ---
 
@@ -29,36 +23,40 @@ The last reliability fixes in this pass were:
 Slack App / WhatsApp
     │
     ▼
-Slack bridge / WhatsApp bridge  ── per-user queue ── registry lookup ── pending-run recovery
+Slack bridge / WhatsApp bridge  ── per-user queue ── pending-run recovery ── admin audit
     │
-    ├── Host-side deterministic helpers
-    │     ├── Freshrelease REST
-    │     ├── Google gog helper
-    │     ├── Yahoo mail helper
-    │     └── WhatsApp/notification helpers
+    ├── Host-side control plane
+    │     ├── self-service !setup credential handling
+    │     ├── add/delete/purge/show admin commands
+    │     ├── Yahoo / email-query helpers
+    │     ├── WhatsApp bridge helpers
+    │     └── rate-limit cooldown + inference fallback routing
     │
     └── OpenShell sandboxes
           ├── one sandbox per user
-          ├── direct Claude Code foreground path for coding tasks
-          └── shared workspace defaults + per-user credentials
+          ├── shared workspace defaults + per-user credentials
+          ├── in-sandbox Freshrelease MCP and Google gog access
+          └── Claude Code foreground path for coding tasks
 
 Shared control files:
   ~/.nemoclaw/users.json
   ~/.nemoclaw/sandboxes.json
   config/multi-user/runtime.json
-  persist/migration/live-snapshot/
+  persist/audit/admin-actions.log
+  persist/users/<slack-user-id>/
 ```
 </details>
 
 ### Design Decisions
 
 - One Slack app handles all users.
+- The bridge only responds in 1:1 Slack DMs.
 - One user maps to one sandbox and one workspace.
 - Per-user queues serialize work per claw.
 - Pending Slack runs persist to disk and expire cleanly on restart.
-- Deterministic host-side helpers are preferred for SaaS integrations when sandbox egress is brittle.
-- Claude Code is used directly for real coding tasks and kept in the foreground.
+- Admin commands are handled directly on the host, not by the sandbox agent.
 - Shared runtime behavior comes from repo config instead of prompt drift.
+- Claude Code is used directly for coding tasks and kept in the foreground.
 
 ---
 
@@ -68,22 +66,25 @@ Shared runtime policy is defined in [config/multi-user/runtime.json](config/mult
 
 It controls:
 
-- sandbox create and readiness timeouts
-- reconcile timeout
-- resilience helper timeout
-- default and conditional network policy presets
+- sandbox create, readiness, and post-create recovery timeouts
+- reconcile and resilience helper timeouts
+- default network policy presets: `npm`, `pypi`, and `slack`
+- conditional policy presets for Google and Freshrelease credentials
 - shared workspace default files
+- default tool-priority guidance
 
 Implementation helpers:
 
 - [bin/lib/runtime-config.js](bin/lib/runtime-config.js)
 - [bin/lib/sandbox-lifecycle.js](bin/lib/sandbox-lifecycle.js)
+- [bin/lib/bootstrap.js](bin/lib/bootstrap.js)
+- [bin/lib/reconcile.js](bin/lib/reconcile.js)
 
 ### Sandbox Lifecycle
 
-The recovery baseline no longer treats wrapper noise as authoritative. If a sandbox actually becomes `Ready`, create/bootstrap flows treat that as success even if the originating shell command is noisy or late to exit.
+Create and bootstrap flows now treat actual sandbox health as authoritative. If a sandbox reaches `Ready`, lifecycle helpers treat that as success even when the wrapper command is noisy or exits late.
 
-This is now used by:
+This behavior is used by:
 
 - [bin/lib/bootstrap.js](bin/lib/bootstrap.js)
 - [bin/lib/reconcile.js](bin/lib/reconcile.js)
@@ -93,38 +94,95 @@ This is now used by:
 
 ## Inference and Tooling Policy
 
-### Operating policy
+### Operating Policy
 
-The Codex-managed operating policy is:
+The shared tool order is:
 
 | Priority | Path | Purpose |
 |----------|------|---------|
 | 1 | Direct APIs | Stable SaaS integrations where simple REST works |
 | 2 | Native CLIs | GitHub, git, language tools, sandbox commands |
-| 3 | Local helper scripts | Deterministic wrappers for flaky or repetitive workflows |
-| 4 | Skills/plugins | Structured workflows where needed |
-| 5 | Claude Code | Real coding, migrations, testing, commits, PRs |
+| 3 | Local helper scripts | Deterministic wrappers for repetitive or brittle host flows |
+| 4 | Skills or plugins | Structured workflows where needed |
+| 5 | Claude Code | Coding, migrations, testing, commits, PRs |
 
-### Current practical usage
+### Current Practical Usage
 
 | Capability | Current path |
 |------------|--------------|
-| Coding / migrations / PR work | Direct Claude Code inside sandbox, foreground only |
-| Freshrelease | Deterministic REST helper, no MCP |
-| Google tasks / calendar | Host-side `gog` helper |
-| Yahoo mail | Host-side helper |
+| Coding and repo work | Direct Claude Code inside the sandbox, foreground only |
+| Freshrelease | In-sandbox Freshrelease MCP via `mcporter` |
+| Google tasks and calendar | In-sandbox `gog` |
+| Yahoo mail and email triage | Host-side `email-query.py` and `yahoo-mail.py` |
 | WhatsApp routing | Host-side bridge/helper |
+| Admin operations | Host-side Slack bridge commands plus audit log |
 
-### Target model policy
+### Inference Routing
 
-The desired model policy for the claw fleet remains:
+The steady-state preference is still Anthropic for Claude-authenticated runs, but the bridge now owns fallback routing when that path is unavailable.
 
-- Primary claw agent model: Anthropic Sonnet
-- Fallback 1: NVIDIA Nemotron Instruct
-- Fallback 2: NVIDIA Llama 70B
-- Claude Code: Anthropic only
+Current behavior:
 
-That policy is documented as the intended operating model even where some live paths still rely on legacy OpenClaw runtime behavior.
+- if Anthropic auth fails or the provider is rate-limited, the bridge pauses new launches briefly with a global cooldown
+- the bridge can switch the sandbox to NVIDIA NIM fallback using the first configured NVIDIA model
+- if that fails, it can try local Ollama fallback models in order: `deepseek-r1:70b`, `qwen3-coder:30b`, `gpt-oss:latest`
+- after a fallback run, the bridge restores the sandbox primary model
+- selection metadata is synced into the sandbox so the user-visible runtime stays aligned with the active provider route
+
+The route metadata defaults to NVIDIA-managed inference settings, while per-user Claude setup resets the sandbox primary model back to Anthropic for normal runs.
+
+---
+
+## Slack Bridge
+
+[scripts/slack-bridge-multi.js](scripts/slack-bridge-multi.js) is the main user-facing bridge.
+
+Current bridge behavior includes:
+
+- DM-only routing for user requests
+- per-user queueing to avoid OpenClaw session lock conflicts
+- persisted pending-run recovery with stale-run cleanup on restart
+- direct admin command handling with audit logging
+- self-service `!setup` credential and workspace customization flows
+- direct `!yahoo` and `!wa` host-side commands
+- natural-language Yahoo email queries routed through `email-query.py`
+- retry handling for the user's previous request
+- fail-closed handling for unknown `!` commands
+
+### Admin Commands
+
+Admin commands are handled directly by the bridge and do not go through the sandbox agent.
+
+The current operator surface is:
+
+- `!admin-help`
+- `!admins`
+- `!admin-audit`
+- `!show-claws [ready|not-ready|registered|unregistered|admins|non-admins|gpu] [sort=name|user|status|uptime] [match=...] [policy=...] [cred=...]`
+- `!show-user <slack-id|claw-name|name-fragment>`
+- `!add-claw <slack_id> <display_name> <claw_name> <github_handle>`
+- `!delete-claw <claw_name>`
+- `!confirm-delete-claw <claw_name>`
+- `!purge-claw <claw_name>`
+
+Delete confirmations expire after five minutes and are lost if the bridge restarts.
+
+### Self-Service Setup
+
+Users can configure most personal state from Slack DM with `!setup`.
+
+The current setup surface includes:
+
+- Claude OAuth JSON or long-lived Claude token
+- GitHub token
+- Google `gogcli` credential archive
+- Freshrelease API key
+- WhatsApp number and optional webhook
+- timezone
+- `SOUL.md`, `IDENTITY.md`, `USER.md`, and `HEARTBEAT.md` content
+- `!setup status` and `!setup help`
+
+Credential-bearing `!setup` commands are DM-only. The bridge attempts to delete the original Slack credential message after processing.
 
 ---
 
@@ -132,93 +190,72 @@ That policy is documented as the intended operating model even where some live p
 
 ### Slack
 
-[scripts/slack-bridge-multi.js](scripts/slack-bridge-multi.js) is the main user-facing bridge.
+Slack is the main operator and user interface.
 
-Current capabilities validated during sanity testing:
+Validated or implemented capabilities in the current bridge include:
 
 - normal claw prompts
-- repo/coding tasks
-- direct Claude Code tasks
-- Freshrelease queries with clickable links
-- Google tasks/calendar queries with clickable links
-- retry handling for previous requests
+- coding and repo tasks through direct Claude Code routing
+- Freshrelease and Google requests through in-sandbox tools
+- natural-language Yahoo inbox and search queries
+- direct `!yahoo` mail actions
+- direct `!wa` and `!whatsapp` host-side actions
+- retry of the previous user request
 - stale pending-run cleanup on restart
-- unknown `!` commands fail closed instead of dumping sandbox startup noise
-- `!purge-claw <name>` is supported as a one-step destructive admin command
+- admin inventory and destructive lifecycle commands
 
 ### WhatsApp
 
-[scripts/whatsapp-bridge-multi.js](scripts/whatsapp-bridge-multi.js) remains in place. Core routing and preserved auth state were carried forward, but WhatsApp was not the main focus of the initial sanity pass.
+[scripts/whatsapp-bridge-multi.js](scripts/whatsapp-bridge-multi.js) remains in place for per-user messaging and notification forwarding. The Slack bridge can also forward notification-like messages to a user's configured WhatsApp number.
 
 ---
 
 ## Freshrelease Integration
 
-Freshrelease is now intentionally kept off MCP.
+Freshrelease now follows the shared tool policy in [persist/workspace/TOOLS.md](persist/workspace/TOOLS.md).
 
-### Rules
+Current rules:
 
-- Use direct REST only
-- Do not ask for the subdomain if the configured host is already known
-- Do not route Freshrelease through Claude Code or browser relay
-
-### Current host
-
-- `https://freshworks.freshrelease.com`
-
-### Deterministic helper
-
-- [scripts/freshrelease-epics.py](scripts/freshrelease-epics.py)
-
-Current supported natural-language coverage includes:
-
-- active epics by project
-- child stories/issues under an epic
-- issue details
-- state filtering such as `open`
-- clickable issue links
-
-Returned fields were expanded to include:
-
-- assigned user
-- current state
-- created date
-- targeted date
-- updated date
-- description and comments for issue detail views
-
-Recent hardening:
-
-- transient API/network failures now retry before failing
-- per-project failures return readable errors instead of Python tracebacks
-- helper can resolve friendly project names through Freshrelease project discovery when exact keys are not supplied
+- use the in-sandbox Freshrelease MCP server via `mcporter`
+- keep the user's Freshrelease API key in their per-user credential directory
+- allow the `freshworks` policy preset when the user has Freshrelease credentials
+- do not route normal Freshrelease work through host-side helper scripts
+- use Claude Code only when the task is actually coding work, not for routine Freshrelease queries
 
 ---
 
 ## Google Integration
 
-Google access currently uses a host-side helper rather than sandbox egress.
+Google access runs inside the sandbox via `gog`.
 
-Helper:
+Current rules:
 
-- [scripts/gog-query.py](scripts/gog-query.py)
+- inject the user's `gogcli` credentials into the sandbox with `!setup google`
+- allow the `google` policy preset when the user has Google credentials
+- use Google Tasks and Google Calendar from inside the claw
+- keep reminder-like requests on Google Tasks by default unless the user explicitly wants a calendar event
 
-Reasons:
+Yahoo remains host-side because the deployed path still depends on direct mail access outside the sandbox proxy flow.
 
-- more reliable than sandbox DNS/proxy paths
-- per-user `gogcli` bundles already exist
-- simpler to debug than in-sandbox OAuth/eager network policy work
+---
 
-Recent hardening:
+## Email Handling
 
-- helper now resolves the `gog` binary explicitly instead of relying on inherited daemon PATH
-- this prevents Slack bridge processes from failing when interactive shells can find `gog` but service-like processes cannot
+Yahoo mail is handled on the host.
+
+Current paths:
+
+- explicit mail commands go through `!yahoo`
+- natural-language inbox or search requests are parsed by the Slack bridge and routed through [scripts/email-query.py](scripts/email-query.py)
+- mail results are normalized into concise Markdown tables before they are returned to Slack
+
+The bridge also remembers the last Yahoo-style request so a follow-up such as a year refinement can reuse the same search intent.
 
 ---
 
 ## OpenClaw Admin UI Access
 
-The direct `openshell sandbox ssh-config ...` plus `ssh -L ...` path was unreliable for Control UI HTTP/WebSocket traffic in this environment. The stable working path is:
+The direct `openshell sandbox ssh-config ...` plus `ssh -L ...` path was unreliable for Control UI HTTP and WebSocket traffic in this environment. The stable working path is:
 
 1. On the Linux host, run a Kubernetes port-forward from the OpenShell sidecar container:
 
@@ -247,8 +284,8 @@ http://localhost:18889/#token=<gateway-token>
 
 Notes:
 
-- In this topology, browser device pairing was unreliable, but explicit token auth worked.
-- `localhost` and `127.0.0.1` must be treated consistently because the Control UI keys stored auth state by gateway URL/origin.
+- browser device pairing was unreliable in this topology, but explicit token auth worked
+- `localhost` and `127.0.0.1` must be treated consistently because the Control UI stores auth state by gateway URL and origin
 
 ---
 
@@ -265,9 +302,14 @@ The current system preserves:
 - display name
 - sandbox name
 - GitHub user
-- enabled/disabled state
+- enabled or disabled state
+- timezone
 - roles
-- per-user credential/workspace paths
+- per-user credential and workspace paths
+
+Admin actions are also appended to:
+
+- `persist/audit/admin-actions.log`
 
 ---
 
@@ -281,7 +323,7 @@ persist/users/<slack-user-id>/
   workspace/
 ```
 
-Shared workspace defaults now live in repo-owned files under:
+Shared workspace defaults live in repo-owned files under:
 
 - [persist/workspace](persist/workspace)
 
@@ -295,143 +337,4 @@ These defaults include:
 - `TOOLS.md`
 - `USER.md`
 
-These are copied into new claws and can be resynced into existing claws. `USER.md` should generally remain user-specific once customized.
-
----
-
-## Migration Tooling
-
-Codex-managed rebuild and recovery now uses explicit local tooling instead of shell history.
-
-### Commands
-
-```text
-nemoclaw migration-export [--output DIR]
-nemoclaw migration-import --input DIR [--force]
-nemoclaw migration-inspect --input DIR
-nemoclaw migration-restore-user --input DIR --slack-id ID [--force]
-nemoclaw migration-restore-all --input DIR [--force] [--include-disabled]
-nemoclaw bootstrap-user <id> [--dry-run]
-nemoclaw bootstrap-all [--dry-run] [--include-disabled]
-nemoclaw reconcile-user <id> [--dry-run]
-nemoclaw reconcile-all [--dry-run] [--include-disabled]
-```
-
----
-
-## Commit and Push Guidance
-
-This migration produced two distinct classes of change:
-
-### Commit-worthy repo changes
-
-- bridge behavior
-- deterministic helper scripts
-- migration/bootstrap/reconcile/runtime code
-- tests
-- docs
-- shared workspace defaults
-- skills under `.agents/skills/`
-
-### Do not push live machine state or secrets
-
-- `persist/users/**/credentials/**`
-- `persist/gateway/**`
-- `persist/pending-slack-runs.json`
-- `persist/migration/live-snapshot/**`
-- `persist/audit/**`
-- `nohup.out`
-- ad hoc local scratch directories such as `.entire/` or `.remember/`
-
-Before pushing, the worktree should be split so product code/docs are committed, while live deployment state stays local or is moved into explicitly redacted example fixtures.
-
-Main implementation files:
-
-- [bin/lib/migration.js](bin/lib/migration.js)
-- [bin/lib/bootstrap.js](bin/lib/bootstrap.js)
-- [bin/lib/reconcile.js](bin/lib/reconcile.js)
-
-Live snapshot:
-
-- [live-snapshot](persist/migration/live-snapshot)
-
----
-
-## Automation
-
-### Still active
-
-- bridge supervision / watchdog
-- Yahoo periodic summary checks
-- WhatsApp/Slack notification forwarding where configured
-
-### No longer the desired steady-state model
-
-- blind periodic credential reinjection as the main correctness mechanism
-- browser/MCP fallback for Freshrelease
-- background Claude Code delegation that reports success before work is finished
-
-The system is now moving toward:
-
-- reconcile-on-change
-- deterministic helpers
-- explicit migration/restore flows
-- config-driven runtime behavior
-
----
-
-## Security and Reliability
-
-### Preserved
-
-- per-user credential isolation
-- RBAC for admin commands
-- network policy enforcement per sandbox
-- audit logging
-
-### Improved during Codex-managed recovery
-
-- stale pending-run cleanup
-- retry safety
-- output redaction for leaked secrets in Slack responses
-- recoverable `user-add` path
-- wrapper hardening around late/noisy sandbox create behavior
-
----
-
-## Migration Status
-
-| Step | Status |
-|------|--------|
-| Freeze and export current state | Completed |
-| Define shared runtime/config model | Completed |
-| Build deterministic rebuild tooling | Completed |
-| Rebuild active claws | Completed |
-| Restore Vamsee-specific integrations | Completed |
-| Stabilize Slack developer experience | Completed |
-| Normalize shared claw instructions | Completed |
-| Fix official CLI/operator path | Completed |
-| Make provisioning recoverable | Completed |
-| Clean stale runtime state | Completed |
-| Harden wrapper/runtime issues | Completed |
-| Validate Slack-side admin flows | Pending |
-| Final ops cutover from Claude-managed to Codex-managed | In progress, functionally complete except admin Slack validation |
-
----
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| [bin/nemoclaw.js](bin/nemoclaw.js) | CLI entry point and user lifecycle commands |
-| [bin/lib/runtime-config.js](bin/lib/runtime-config.js) | Shared multi-user runtime config loader |
-| [bin/lib/sandbox-lifecycle.js](bin/lib/sandbox-lifecycle.js) | Health-first sandbox create/readiness helpers |
-| [bin/lib/migration.js](bin/lib/migration.js) | Export/import/inspect/restore tooling |
-| [bin/lib/bootstrap.js](bin/lib/bootstrap.js) | Sandbox bootstrap/adopt flow |
-| [bin/lib/reconcile.js](bin/lib/reconcile.js) | Credential reconcile flow |
-| [scripts/slack-bridge-multi.js](scripts/slack-bridge-multi.js) | Main multi-user Slack bridge |
-| [scripts/freshrelease-epics.py](scripts/freshrelease-epics.py) | Deterministic Freshrelease helper |
-| [scripts/gog-query.py](scripts/gog-query.py) | Host-side Google helper |
-| [scripts/inject-user-credentials.sh](scripts/inject-user-credentials.sh) | Per-user credential injection |
-| [scripts/nemoclaw-resilience.sh](scripts/nemoclaw-resilience.sh) | Full bring-up / recovery script |
-| [docs/reference/multi-user-runtime.md](docs/reference/multi-user-runtime.md) | Runtime policy reference |
+These files are copied into new claws and can be resynced into existing claws. `USER.md` should generally remain user-specific once customized.
