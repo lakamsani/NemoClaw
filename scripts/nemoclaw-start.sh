@@ -377,6 +377,33 @@ PYPATCH
   echo "[config] openclaw.json updated with Anthropic API key and default model"
 }
 
+disable_memory_search_for_slack_runs() {
+  if [ -z "${NEMOCLAW_SLACK_USER_ID:-}" ]; then
+    return
+  fi
+  python3 - <<'PYPATCH'
+import json, os
+path = os.path.expanduser('~/.openclaw/openclaw.json')
+if not os.path.exists(path) or not os.access(path, os.W_OK):
+    raise SystemExit(0)
+try:
+    cfg = json.load(open(path))
+except Exception:
+    cfg = {}
+agents = cfg.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+memory = defaults.setdefault('memorySearch', {})
+memory['enabled'] = False
+sync = memory.setdefault('sync', {})
+sync['onSessionStart'] = False
+sync['onSearch'] = False
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o600)
+PYPATCH
+  refresh_config_hash
+  echo "[config] openclaw.json updated to disable memory search for Slack foreground runs"
+}
+
 inject_slack_webhook() {
   # Persist SLACK_WEBHOOK_URL to /sandbox/.env for heartbeat notifications
   if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
@@ -414,6 +441,7 @@ inject_gog_keyring_password
 write_auth_profile
 export CHAT_UI_URL PUBLIC_PORT
 update_anthropic_apikey_in_config
+disable_memory_search_for_slack_runs
 openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
 
 # ── Proxy environment ────────────────────────────────────────────
@@ -506,6 +534,7 @@ inject_gog_credentials
 inject_slack_webhook
 inject_gog_keyring_password
 update_anthropic_apikey_in_config
+disable_memory_search_for_slack_runs
 
 # ── Non-root fallback ──────────────────────────────────────────
 # OpenShell runs containers with --security-opt=no-new-privileges, which

@@ -60,8 +60,17 @@ Skills provide specialized workflows. Use `TOOLS.md` for tool preferences and lo
 For GitHub issue, branch, commit, pull request, merge, and close workflows:
 
 - Maintain `session-artifacts.json` in this workspace as the session-local task record.
+- Do not hand-edit `session-artifacts.json`.
+- Always update it with `python3 scripts/session_artifacts.py ...`.
 - Update it after identifying the repo or issue, creating or switching branches, pushing commits, opening PRs, merging PRs, and closing issues.
 - Store only concrete execution artifacts there: repo, issue number and URL, branch, latest pushed commit SHA, PR number and URL, statuses, and `updated_at`.
+- Use these helper commands:
+  - `python3 scripts/session_artifacts.py set-repo owner/repo`
+  - `python3 scripts/session_artifacts.py set-issue --number 10 --url https://github.com/owner/repo/issues/10 --status open`
+  - `python3 scripts/session_artifacts.py set-branch --name feature/my-branch`
+  - `python3 scripts/session_artifacts.py set-commit --sha abc1234`
+  - `python3 scripts/session_artifacts.py set-pr --number 11 --url https://github.com/owner/repo/pull/11 --status open`
+  - `python3 scripts/session_artifacts.py show`
 - Before asking what `that PR`, `the issue`, `it`, or `that branch` refers to, first resolve it from the recent conversation, `session-artifacts.json`, local git state, and GitHub CLI state if available.
 - Ask for clarification only when multiple plausible targets exist, the artifact file is missing, the artifact conflicts with current repo state, or the user is clearly switching tasks.
 - End GitHub task responses with a compact execution summary containing repo, issue, PR, branch, and status.

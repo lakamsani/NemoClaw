@@ -48,6 +48,8 @@ const REPO_DIR = require("path").resolve(__dirname, "..");
 const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication|401.*auth|expired.*token|OAuth token has expired/i;
 const RATE_LIMIT_RE = /rate.limit|429|too many requests|overloaded|capacity/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
+const DEFAULT_STARTUP_STALL_MS = 180000;
+const STARTUP_STALL_MS = Number.parseInt(process.env.NEMOCLAW_STARTUP_STALL_MS || "", 10) || DEFAULT_STARTUP_STALL_MS;
 const pendingDeleteRequests = new Map();
 const lastEmailRequests = new Map();
 const lastUserRequests = new Map();
@@ -1279,7 +1281,8 @@ function buildAgentCommand(message, sessionId, user, options = {}) {
   const scriptLines = [...setupLines];
   // Clean stale session locks before running (zombie openclaw-agent processes leave orphan locks)
   scriptLines.push(`find /sandbox/.openclaw/agents -name '*.lock' -mmin +2 -delete 2>/dev/null || true`);
-  scriptLines.push(`nemoclaw-start openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
+  scriptLines.push(`NEMOCLAW_START_BIN=/usr/local/bin/nemoclaw-start; [ -x /sandbox/bin/nemoclaw-start ] && NEMOCLAW_START_BIN=/sandbox/bin/nemoclaw-start`);
+  scriptLines.push(`"$NEMOCLAW_START_BIN" openclaw agent --agent main --local -m '${escaped}' --session-id 'slack-${sessionId}'`);
   return scriptLines.join("\n");
 }
 
@@ -2066,6 +2069,40 @@ function getRemoteFileStat(confPath, sandboxName, filePath) {
   return { size, mtimeMs };
 }
 
+function readSessionArtifacts(confPath, sandboxName) {
+  try {
+    const raw = sshExec(
+      confPath,
+      sandboxName,
+      "cat /sandbox/.openclaw-data/workspace/session-artifacts.json 2>/dev/null || echo __missing__",
+      10000,
+    );
+    if (!raw || raw === "__missing__") return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function buildArtifactRecoveryResponse(before, after) {
+  if (!after || typeof after !== "object") return "";
+  const beforePrUrl = before?.pull_request?.url || "";
+  const afterPrUrl = after?.pull_request?.url || "";
+  if (afterPrUrl && afterPrUrl !== beforePrUrl) {
+    const prNumber = after?.pull_request?.number ? `#${after.pull_request.number}` : "created";
+    return `PR ${prNumber}: ${afterPrUrl}`;
+  }
+
+  const beforeIssueUrl = before?.issue?.url || "";
+  const afterIssueUrl = after?.issue?.url || "";
+  if (afterIssueUrl && afterIssueUrl !== beforeIssueUrl) {
+    const issueNumber = after?.issue?.number ? `#${after.issue.number}` : "created";
+    return `Issue ${issueNumber}: ${afterIssueUrl}`;
+  }
+
+  return "";
+}
+
 async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const sandboxName = user.sandboxName;
   const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
@@ -2086,11 +2123,18 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const tag = `slack-${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
   const outFile = `/tmp/nemoclaw-agent-${tag}.out`;
   const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
+  const artifactBefore = readSessionArtifacts(confPath, sandboxName);
 
   const agentCmd = buildAgentCommand(message, sessionId, user, options);
 
-  // Fire: launch agent in background, redirect output to file, write exit code when done
-  const launchCmd = `( ${agentCmd} ) > ${outFile} 2>&1; echo $? > ${rcFile}`;
+  // Fire: launch agent in background, redirect output to file, always attempt to write rc on shell exit.
+  const launchCmd = [
+    "status=124",
+    `trap 'printf \"%s\\n\" \"${"${status:-1}"}\" > ${rcFile}' EXIT`,
+    `( ${agentCmd} ) > ${outFile} 2>&1`,
+    "status=$?",
+    "exit $status",
+  ].join("; ");
   try {
     sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
     updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
@@ -2109,7 +2153,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   let pollCount = 0;
   let lastOutputStat = null;
   let lastOutputProgressAt = startTime;
-  const startupStallMs = 60000;
+  dbg(`STALL threshold ${Math.round(STARTUP_STALL_MS / 1000)}s without output progress`);
 
   while (Date.now() - startTime < maxWaitMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
@@ -2124,18 +2168,28 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
           || currentStat.mtimeMs !== lastOutputStat.mtimeMs)) {
           lastOutputProgressAt = Date.now();
           lastOutputStat = currentStat;
+          dbg(`OUTPUT progress size=${currentStat.size} at ${Math.round((Date.now() - startTime) / 1000)}s`);
         }
-        if (currentStat && Date.now() - lastOutputProgressAt >= startupStallMs) {
+        if (currentStat && Date.now() - lastOutputProgressAt >= STARTUP_STALL_MS) {
           const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
           const partial = filterAgentOutput(raw);
           if (!partial) {
-            dbg(`STALL no progress for ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s`);
+            const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
+            if (recovered) {
+              dbg(`RECOVERED from artifacts on stall: "${recovered}"`);
+              sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
+              try { fs.unlinkSync(confPath); } catch {}
+              return recovered;
+            }
+            dbg(`STALL no progress for ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s (elapsed ${Math.round((Date.now() - startTime) / 1000)}s)`);
             sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
             try { fs.unlinkSync(confPath); } catch {}
             return buildFriendlyFailure("sandbox", "startup stalled before producing a response");
           }
         }
-        if (pollCount % 20 === 0) dbg(`POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
+        if (pollCount % 20 === 0) {
+          dbg(`POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed, last output ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s ago)`);
+        }
         continue;
       }
 
@@ -2152,6 +2206,11 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       const response = filterAgentOutput(raw);
       dbg(`FILTERED response: ${response.length} bytes, first 80: "${response.slice(0, 80)}"`);
       if (response) return response;
+      const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
+      if (recovered) {
+        dbg(`RECOVERED from artifacts after rc=${rc}: "${recovered}"`);
+        return recovered;
+      }
       if (rc !== "0") return buildFriendlyFailure("sandbox", raw);
       return "(no response)";
     } catch (err) {
@@ -2176,6 +2235,11 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
     const partial = filterAgentOutput(raw);
     dbg(`TIMEOUT partial: ${partial.length} bytes`);
     if (partial) return partial + "\n\n_(timed out after 30 minutes)_";
+    const recovered = buildArtifactRecoveryResponse(artifactBefore, readSessionArtifacts(confPath, sandboxName));
+    if (recovered) {
+      dbg(`RECOVERED from artifacts on timeout: "${recovered}"`);
+      return recovered;
+    }
   } catch {}
   try { fs.unlinkSync(confPath); } catch {}
   return buildFriendlyFailure("sandbox", "timed out");

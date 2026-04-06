@@ -35,6 +35,7 @@ const DEFAULT_RUNTIME_CONFIG = {
       "HEARTBEAT.md",
       "AGENTS.md",
       "session-artifacts.json",
+      "scripts/session_artifacts.py",
       "BOOTSTRAP.md",
     ],
   },
@@ -95,6 +96,7 @@ function copySharedWorkspaceFiles(repoRoot, workspaceDir, { overwrite = false } 
     const dst = path.join(workspaceDir, file);
     if (!fs.existsSync(src)) continue;
     if (!overwrite && fs.existsSync(dst)) continue;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
     fs.copyFileSync(src, dst);
     copied.push(file);
   }
