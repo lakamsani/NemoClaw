@@ -17,8 +17,8 @@ It defines:
 
 The current production model is:
 
-- Freshrelease uses direct REST plus local helpers
-- Google uses host-side `gog` helpers
+- Freshrelease runs inside the sandbox
+- Google runs inside the sandbox via `gog`
 - Yahoo and WhatsApp use host-side scripts
 - Claude Code is reserved for real coding tasks
 - Sandboxes should be treated as successful once they are actually `Ready`, even if a wrapper command is noisy or late to exit

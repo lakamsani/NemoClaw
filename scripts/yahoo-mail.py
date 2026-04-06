@@ -19,6 +19,7 @@
 import argparse
 import email
 import email.utils
+import json
 import imaplib
 import os
 import smtplib
@@ -149,8 +150,7 @@ def cmd_inbox(args):
             return
         latest = ids[-(args.count):]
         latest.reverse()
-        print(f"{'ID':>6}  {'Date':20}  {'From':30}  Subject")
-        print("-" * 100)
+        rows = []
         for mid in latest:
             _, msg_data = imap.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
             raw = msg_data[0][1]
@@ -158,7 +158,19 @@ def cmd_inbox(args):
             frm = decode_hdr(msg.get("From", ""))[:30]
             subj = decode_hdr(msg.get("Subject", ""))[:60]
             date = decode_hdr(msg.get("Date", ""))[:20]
-            print(f"{mid.decode():>6}  {date:20}  {frm:30}  {subj}")
+            rows.append({
+                "id": mid.decode(),
+                "date": date,
+                "from": frm,
+                "subject": subj,
+            })
+        if args.json:
+            print(json.dumps(rows))
+            return
+        print(f"{'ID':>6}  {'Date':20}  {'From':30}  Subject")
+        print("-" * 100)
+        for row in rows:
+            print(f"{row['id']:>6}  {row['date']:20}  {row['from']:30}  {row['subject']}")
     finally:
         try:
             imap.logout()
@@ -228,8 +240,7 @@ def cmd_search(args):
             return
         latest = ids[-(args.count):]
         latest.reverse()
-        print(f"{'ID':>6}  {'Date':20}  {'From':30}  Subject")
-        print("-" * 100)
+        rows = []
         for mid in latest:
             _, msg_data = imap.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
             raw = msg_data[0][1]
@@ -237,7 +248,19 @@ def cmd_search(args):
             frm = decode_hdr(msg.get("From", ""))[:30]
             subj = decode_hdr(msg.get("Subject", ""))[:60]
             date = decode_hdr(msg.get("Date", ""))[:20]
-            print(f"{mid.decode():>6}  {date:20}  {frm:30}  {subj}")
+            rows.append({
+                "id": mid.decode(),
+                "date": date,
+                "from": frm,
+                "subject": subj,
+            })
+        if args.json:
+            print(json.dumps(rows))
+            return
+        print(f"{'ID':>6}  {'Date':20}  {'From':30}  Subject")
+        print("-" * 100)
+        for row in rows:
+            print(f"{row['id']:>6}  {row['date']:20}  {row['from']:30}  {row['subject']}")
     finally:
         try:
             imap.logout()
@@ -247,6 +270,7 @@ def cmd_search(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Yahoo Mail CLI")
+    parser.add_argument("-j", "--json", action="store_true")
     sub = parser.add_subparsers(dest="command")
 
     p_inbox = sub.add_parser("inbox", help="List inbox messages")

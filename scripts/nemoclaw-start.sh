@@ -115,6 +115,15 @@ verify_config_integrity() {
   fi
 }
 
+refresh_config_hash() {
+  local path="/sandbox/.openclaw/openclaw.json"
+  local hash_file="/sandbox/.openclaw/.config-hash"
+  if [ -f "$path" ]; then
+    sha256sum "$path" > "$hash_file"
+    chmod 600 "$hash_file" 2>/dev/null || true
+  fi
+}
+
 write_auth_profile() {
   python3 - <<'PYAUTH'
 import json
@@ -364,6 +373,7 @@ cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})[
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
 PYPATCH
+  refresh_config_hash
   echo "[config] openclaw.json updated with Anthropic API key and default model"
 }
 

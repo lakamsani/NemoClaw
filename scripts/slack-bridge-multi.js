@@ -49,9 +49,7 @@ const AUTH_ERROR_RE = /authentication_error|invalid_grant|Invalid authentication
 const RATE_LIMIT_RE = /rate.limit|429|too many requests|overloaded|capacity/i;
 const ADMIN_AUDIT_LOG = `${REPO_DIR}/persist/audit/admin-actions.log`;
 const pendingDeleteRequests = new Map();
-const FRESHRELEASE_HELPER = path.join(REPO_DIR, "scripts", "freshrelease-epics.py");
-const GOG_HELPER = path.join(REPO_DIR, "scripts", "gog-query.py");
-const lastFreshreleaseRequests = new Map();
+const lastEmailRequests = new Map();
 const lastUserRequests = new Map();
 
 // ── Global rate limit throttle ───────────────────────────────────
@@ -176,82 +174,10 @@ function isKnownBangCommand(text) {
     || /^!yahoo\b/i.test(normalized);
 }
 
-function parseFreshreleaseEpicRequest(text) {
-  const normalized = normalizeText(text);
-  if (!/\bepics?\b/i.test(normalized)) return null;
-  const projects = extractFreshreleaseProjects(normalized);
-  if (projects.length === 0) return null;
-  const limitMatch = normalized.match(/\b(?:top|get|show|list)?\s*(\d+)\s+(?:most\s+active\s+)?epics?\b/i)
-    || normalized.match(/\bmost\s+active\s+epics?\b.*?\b(\d+)\b/i);
-  const parsedLimit = limitMatch ? Number.parseInt(limitMatch[1], 10) : 3;
-  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 10)) : 3;
-  return { projects, limit, statusQuery: parseFreshreleaseStatusQuery(normalized) };
-}
-
-function parseFreshreleaseChildrenRequest(text) {
-  const normalized = normalizeText(text);
-  if (!/\b(stories|story|children|child|issues)\b/i.test(normalized) || !/\bunder\b/i.test(normalized)) return null;
-  const match = normalized.toUpperCase().match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
-  if (!match) return null;
-  return { parentKey: match[1], statusQuery: parseFreshreleaseStatusQuery(normalized) };
-}
-
-function parseFreshreleaseIssueDetailRequest(text) {
-  const normalized = normalizeText(text);
-  if (!/\b(detail|details|describe|show|description|comments?)\b/i.test(normalized)) return null;
-  const match = normalized.toUpperCase().match(/\b([A-Z][A-Z0-9]+-\d+)\b/);
-  if (!match) return null;
-  return { issueKey: match[1] };
-}
-
-function extractFreshreleaseProjects(text) {
-  const normalized = normalizeText(text).toUpperCase();
-  const issuePrefixes = [...normalized.matchAll(/\b([A-Z][A-Z0-9]+)-\d+\b/g)].map((match) => match[1]);
-  const uppercaseTokens = normalized.match(/\b[A-Z][A-Z0-9]{2,}\b/g) || [];
-  const stopWords = new Set([
-    "ACTIVE", "ALL", "AND", "ARE", "ASSIGNED", "BACKLOG", "BOARD", "BY", "COMMENTS",
-    "CURRENT", "DATE", "DESCRIPTION", "DETAIL", "DETAILS", "DONE", "EPIC", "EPICS",
-    "FOR", "FRESHRELEASE", "FROM", "GET", "IN", "ISSUE", "ISSUES", "LIST", "MOST",
-    "MY", "OPEN", "SHOW", "SPRINT", "STATE", "STATUS", "STORIES", "STORY", "TASK",
-    "TASKS", "THE", "TICKET", "TICKETS", "TOP", "UNDER", "UPDATED", "WITH",
-  ]);
-  const candidates = [...issuePrefixes, ...uppercaseTokens]
-    .filter((token) => !stopWords.has(token))
-    .filter((token) => !/^\d+$/.test(token));
-  return [...new Set(candidates)];
-}
-
-function parseFreshreleaseStatusQuery(text) {
-  const normalized = normalizeText(text).toLowerCase();
-  const patterns = [
-    /\bready to test\b/,
-    /\bin review\b/,
-    /\bin progress\b/,
-    /\bto do\b/,
-    /\btodo\b/,
-    /\bblocked\b/,
-    /\bbacklog\b/,
-    /\breopened\b/,
-    /\bdone\b/,
-    /\bopen\b/,
-  ];
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-    if (match) return match[0];
-  }
-  return "";
-}
-
-function hasFreshreleaseCredentials(user) {
+function hasYahooCredentials(user) {
   if (!user) return false;
   const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  return fs.existsSync(path.join(credentialsDir, "freshrelease-api-key.txt"));
-}
-
-function hasGoogleCredentials(user) {
-  if (!user) return false;
-  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  return fs.existsSync(path.join(credentialsDir, "gogcli", "config.json"));
+  return fs.existsSync(path.join(credentialsDir, "yahoo-creds.env"));
 }
 
 function getUserEnvVars(user) {
@@ -270,141 +196,136 @@ function getUserEnvVars(user) {
   return values;
 }
 
-function runGoogleHelper(user, request) {
-  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  const gogDir = path.join(credentialsDir, "gogcli");
-  if (!fs.existsSync(path.join(gogDir, "config.json"))) {
-    throw new Error("Google gogcli credentials are not configured for this user.");
-  }
-  if (!fs.existsSync(GOG_HELPER)) {
-    throw new Error("Google helper script is missing.");
-  }
-  const userEnv = getUserEnvVars(user);
-  const keyringPassword = userEnv.GOG_KEYRING_PASSWORD || process.env.GOG_KEYRING_PASSWORD || "";
-  if (!keyringPassword) {
-    throw new Error("GOG_KEYRING_PASSWORD is not configured for this user.");
-  }
-  const args = request.kind === "tasks"
-    ? [
-      "--tasks",
-      "--limit", String(request.limit),
-      "--status", request.status,
-      "--list-query", request.listQuery || "",
-      "--prefer-personal", request.preferPersonal ? "1" : "0",
-    ]
-    : ["--calendar", "--limit", String(request.limit), "--range", request.range];
-  return execFileSync("python3", [GOG_HELPER, ...args], {
-    cwd: REPO_DIR,
-    encoding: "utf-8",
-    timeout: 45000,
-    env: {
-      ...process.env,
-      GOG_CONFIG_DIR: gogDir,
-      GOG_KEYRING_PASSWORD: keyringPassword,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-}
-
-function parseGoogleRequest(text) {
+function parseYahooRequest(text) {
   const normalized = normalizeText(text);
   const lower = normalized.toLowerCase();
-  if (!/\b(google|gmail|calendar|meeting|event|events|task|tasks)\b/i.test(normalized)) return null;
-  const limitMatch = lower.match(/\b(?:top|first|show|list|get)?\s*(\d+)\b/);
-  const limit = limitMatch ? Math.max(1, Math.min(Number.parseInt(limitMatch[1], 10) || 5, 25)) : 5;
-  if (/\btasks?\b/.test(lower)) {
-    let status = "open";
-    if (/\bcompleted|done\b/.test(lower)) status = "completed";
-    if (/\ball tasks?\b/.test(lower)) status = "all";
-    let listQuery = "";
-    const fromMatch = lower.match(/\bfrom\s+([a-z0-9][a-z0-9 '&-]*?)\s+tasks?\b/i);
-    if (fromMatch?.[1]) listQuery = fromMatch[1].trim();
-    const possessiveMatch = lower.match(/\bmy\s+([a-z0-9][a-z0-9 '&-]*?)\s+tasks?\b/i);
-    if (!listQuery && possessiveMatch?.[1] && !/\bpersonal\b/i.test(possessiveMatch[1])) listQuery = possessiveMatch[1].trim();
-    const preferPersonal = /\bpersonal tasks?\b|\bmy tasks?\b/.test(lower) && !listQuery;
-    return { kind: "tasks", limit, status, listQuery, preferPersonal };
+  if (!/\b(yahoo|email|emails|mail|inbox)\b/i.test(normalized)) return null;
+  if (/\b(gmail|google|calendar|meeting|event|events|task|tasks|freshrelease|whatsapp)\b/i.test(lower)) return null;
+  const limitMatch = lower.match(/\b(?:top|last|latest|recent|show|list|get)?\s*(\d+)\b/);
+  const count = limitMatch ? Math.max(1, Math.min(Number.parseInt(limitMatch[1], 10) || 10, 25)) : 10;
+  const unread = /\b(unread|pending)\b/.test(lower);
+  const topicMatch = /\bunread\b/.test(lower)
+    ? null
+    : (lower.match(/\b(?:show|list|get|find|search|check|pull)\s+(.+?)\s+emails?\b/i)
+      || lower.match(/\b(.+?)\s+emails?\s+from\s+this year\b/i));
+  const fromMatch = lower.match(/\b(?:emails?|mail)\s+from\s+(.+?)(?:\s+about\b|$)/i)
+    || lower.match(/\bfrom\s+(.+?)(?:\s+emails?\b|\s+mail\b|\s+about\b|$)/i);
+  const aboutMatch = lower.match(/\babout\s+(.+?)$/i)
+    || lower.match(/\bregarding\s+(.+?)$/i);
+  const queryParts = [];
+  if (topicMatch?.[1]) queryParts.push(topicMatch[1].trim());
+  if (fromMatch?.[1]) queryParts.push(fromMatch[1].trim());
+  if (aboutMatch?.[1]) queryParts.push(aboutMatch[1].trim());
+  let year = null;
+  if (/\bthis year\b/.test(lower)) year = new Date().getFullYear();
+  const explicitYear = lower.match(/\b(20\d{2})\b/);
+  if (explicitYear) year = Number.parseInt(explicitYear[1], 10);
+  const cleanedQueryParts = queryParts
+    .map((part) => part.replace(/\bthis year\b/g, "").replace(/\b20\d{2}\b/g, "").trim())
+    .filter(Boolean);
+  if ((/\b(search|find|look for|pull|check|show|get|list)\b/.test(lower) || /\bfrom\b/.test(lower)) && cleanedQueryParts.length > 0) {
+    return { kind: "search", query: cleanedQueryParts.join(" "), count, year };
   }
-  if (/\b(calendar|event|events|meeting|meetings)\b/.test(lower)) {
-    let range = "upcoming";
-    if (/\btoday\b/.test(lower)) range = "today";
-    else if (/\btomorrow\b/.test(lower)) range = "tomorrow";
-    else if (/\bthis week\b/.test(lower)) range = "week";
-    return { kind: "calendar", limit, range };
+  if (/\b(email|emails|mail|inbox)\b/.test(lower)) {
+    return { kind: "inbox", count, unread, year };
   }
   return null;
 }
 
-function runFreshreleaseEpicHelper(user, request) {
+function extractMailRefinement(text) {
+  const lower = normalizeText(text).toLowerCase();
+  let year = null;
+  if (/\bthis year\b/.test(lower)) year = new Date().getFullYear();
+  const explicitYear = lower.match(/\b(20\d{2})\b/);
+  if (explicitYear) year = Number.parseInt(explicitYear[1], 10);
+  if (year !== null) return { year };
+  return null;
+}
+
+function hasGoogleCredentials(user) {
+  if (!user) return false;
   const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
-  if (!fs.existsSync(apiKeyPath)) {
-    throw new Error("Freshrelease API key is not configured for this user.");
+  return fs.existsSync(path.join(credentialsDir, "gogcli", "config.json"));
+}
+
+function loadYahooCreds(user) {
+  const yahooCredsPath = `${REPO_DIR}/persist/users/${user.slackUserId}/credentials/yahoo-creds.env`;
+  if (!fs.existsSync(yahooCredsPath)) {
+    throw new Error("No Yahoo credentials configured. Ask an admin to set up `persist/users/<id>/credentials/yahoo-creds.env` with YAHOO_EMAIL and YAHOO_APP_PWD.");
   }
-  if (!fs.existsSync(FRESHRELEASE_HELPER)) {
-    throw new Error("Freshrelease helper script is missing.");
-  }
-  const apiKey = fs.readFileSync(apiKeyPath, "utf-8").trim();
-  if (!apiKey) {
-    throw new Error("Freshrelease API key is empty.");
-  }
-  return execFileSync("python3", [FRESHRELEASE_HELPER, ...request.projects], {
+  const yahooCreds = {};
+  fs.readFileSync(yahooCredsPath, "utf-8").split("\n").forEach((line) => {
+    const [k, ...v] = line.split("=");
+    if (k && v.length) yahooCreds[k.trim()] = v.join("=").trim();
+  });
+  return yahooCreds;
+}
+
+function runYahooHelper(user, args = []) {
+  return execFileSync("python3", [`${REPO_DIR}/scripts/yahoo-mail.py`, ...args], {
+    encoding: "utf-8",
+    timeout: 30000,
+    env: { ...process.env, ...loadYahooCreds(user) },
+  }).trim();
+}
+
+function runEmailHelper(user, request) {
+  const args = request.kind === "search"
+    ? ["--query", request.query, "--count", String(request.count), ...(request.year ? ["--year", String(request.year)] : [])]
+    : ["--inbox", "--count", String(request.count), ...(request.unread ? ["--unread"] : []), ...(request.year ? ["--year", String(request.year)] : [])];
+  return execFileSync("python3", [`${REPO_DIR}/scripts/email-query.py`, ...args], {
     cwd: REPO_DIR,
     encoding: "utf-8",
     timeout: 45000,
     env: {
       ...process.env,
-      FRESHRELEASE_API_KEY: apiKey,
-      FR_EPIC_LIMIT: String(request.limit),
+      ...(hasYahooCredentials(user) ? loadYahooCreds(user) : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
-}
-
-function runFreshreleaseHelper(user, args = [], extraEnv = {}) {
-  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
-  if (!fs.existsSync(apiKeyPath)) {
-    throw new Error("Freshrelease API key is not configured for this user.");
-  }
-  if (!fs.existsSync(FRESHRELEASE_HELPER)) {
-    throw new Error("Freshrelease helper script is missing.");
-  }
-  const apiKey = fs.readFileSync(apiKeyPath, "utf-8").trim();
-  if (!apiKey) {
-    throw new Error("Freshrelease API key is empty.");
-  }
-  return execFileSync("python3", [FRESHRELEASE_HELPER, ...args], {
-    cwd: REPO_DIR,
-    encoding: "utf-8",
-    timeout: 45000,
-    env: {
-      ...process.env,
-      FRESHRELEASE_API_KEY: apiKey,
-      ...extraEnv,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-}
-
-function getFreshreleaseApiKey(user) {
-  if (!user) return "";
-  const credentialsDir = path.resolve(REPO_DIR, user.credentialsDir || `persist/users/${user.slackUserId}/credentials`);
-  const apiKeyPath = path.join(credentialsDir, "freshrelease-api-key.txt");
-  if (!fs.existsSync(apiKeyPath)) return "";
-  return fs.readFileSync(apiKeyPath, "utf-8").trim();
 }
 
 function redactSensitiveText(text, user) {
   let redacted = String(text || "");
-  const apiKey = getFreshreleaseApiKey(user);
-  if (apiKey) {
-    redacted = redacted.split(apiKey).join("[REDACTED]");
-  }
-  redacted = redacted.replace(/(API key:\s*_?)[A-Za-z0-9_-]+/gi, "$1[REDACTED]");
-  redacted = redacted.replace(/(Authorization:\s*Token\s+)[^\s]+/gi, "$1[REDACTED]");
-  redacted = redacted.replace(/(FRESHRELEASE_API_KEY\s*[=:]\s*)[^\s"'`]+/gi, "$1[REDACTED]");
   redacted = redacted.replace(/(sk-ant-[A-Za-z0-9_-]+)/g, "[REDACTED]");
   return redacted;
+}
+
+function buildFriendlyFailure(kind, detail = "") {
+  const raw = String(detail || "");
+  const normalized = raw.toLowerCase();
+  if (AUTH_ERROR_RE.test(raw)) {
+    return "I'm having a temporary authentication issue. Please try again in a few minutes.";
+  }
+  if (/timeout|timed out/.test(normalized)) {
+    return `I couldn't complete that ${kind} request before timing out. Please try again.`;
+  }
+  if (/unknown command/.test(normalized)) {
+    return "Unknown command.";
+  }
+  if (kind === "Email") {
+    return "I couldn't fetch email for that request. Try rephrasing it with who or what you're looking for.";
+  }
+  if (/sandbox|agent exited|setting up nemoclaw|cap_setpcap|traceback|cannot reach sandbox|error launching/.test(normalized)) {
+    return "I couldn't complete that request in the sandbox. Please try again.";
+  }
+  return `I couldn't complete that ${kind.toLowerCase()} request. Please try again.`;
+}
+
+function sanitizeUserFacingResponse(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  if (/Agent exited with code/i.test(raw)
+    || /Setting up NemoClaw/i.test(raw)
+    || /\[SECURITY\]/i.test(raw)
+    || /CAP_SETPCAP/i.test(raw)
+    || /^Traceback /m.test(raw)
+    || /Cannot reach sandbox/i.test(raw)
+    || /sandbox '.*' unreachable/i.test(raw)
+    || /Error launching/i.test(raw)) {
+    return buildFriendlyFailure("sandbox", raw);
+  }
+  return raw;
 }
 
 function isRetryCommand(text) {
@@ -416,13 +337,13 @@ function isRetryCommand(text) {
     || /^retry last\b/.test(normalized);
 }
 
-function recordFreshreleaseRequest(slackUserId, request) {
+function recordEmailRequest(slackUserId, request) {
   if (!slackUserId || !request) return;
-  lastFreshreleaseRequests.set(slackUserId, request);
+  lastEmailRequests.set(slackUserId, request);
 }
 
-function getRecordedFreshreleaseRequest(slackUserId) {
-  return lastFreshreleaseRequests.get(slackUserId) || null;
+function getRecordedEmailRequest(slackUserId) {
+  return lastEmailRequests.get(slackUserId) || null;
 }
 
 function recordLastUserRequest(slackUserId, text) {
@@ -1933,6 +1854,7 @@ function collapseFreshreleaseTables(response) {
 const PENDING_RUNS_FILE = path.join(REPO_DIR, "persist", "pending-slack-runs.json");
 const PENDING_RUN_EXPIRE_MS = 20 * 60 * 1000;
 const PENDING_RUN_DROP_MS = 6 * 60 * 60 * 1000;
+const PENDING_RUN_LAUNCH_EXPIRE_MS = 2 * 60 * 1000;
 
 function loadPendingRuns() {
   try { return JSON.parse(fs.readFileSync(PENDING_RUNS_FILE, "utf-8")); } catch { return {}; }
@@ -1944,7 +1866,14 @@ function savePendingRuns(runs) {
 
 function addPendingRun(sessionId, info) {
   const runs = loadPendingRuns();
-  runs[sessionId] = { ...info, startedAt: Date.now() };
+  runs[sessionId] = { ...info, startedAt: Date.now(), state: info.state || "launching" };
+  savePendingRuns(runs);
+}
+
+function updatePendingRun(sessionId, patch) {
+  const runs = loadPendingRuns();
+  if (!runs[sessionId]) return;
+  runs[sessionId] = { ...runs[sessionId], ...patch };
   savePendingRuns(runs);
 }
 
@@ -1966,6 +1895,11 @@ function shouldExpirePendingRun(info, now = Date.now()) {
   return getPendingRunAgeMs(info, now) > PENDING_RUN_EXPIRE_MS;
 }
 
+function shouldExpireLaunchingPendingRun(info, now = Date.now()) {
+  return (info?.state || "launching") !== "running"
+    && getPendingRunAgeMs(info, now) > PENDING_RUN_LAUNCH_EXPIRE_MS;
+}
+
 // On bridge startup: recover orphaned completed runs
 async function recoverOrphanedRuns(slackClient) {
   const runs = loadPendingRuns();
@@ -1976,6 +1910,24 @@ async function recoverOrphanedRuns(slackClient) {
   for (const [sessionId, info] of Object.entries(runs)) {
     if (shouldDropPendingRun(info, now)) {
       delete runs[sessionId];
+      continue;
+    }
+
+    if (shouldExpireLaunchingPendingRun(info, now)) {
+      if (info.channel && info.thinkingTs) {
+        try {
+          await slackClient.chat.update({
+            token: SLACK_BOT_TOKEN,
+            channel: info.channel,
+            ts: info.thinkingTs,
+            text: "Previous run did not start successfully. Send the request again to retry.",
+          });
+        } catch (err) {
+          console.error(`[recovery] Failed to mark unstarted run ${sessionId}: ${err.message}`);
+        }
+      }
+      delete runs[sessionId];
+      expired++;
       continue;
     }
 
@@ -2166,6 +2118,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const launchCmd = `( ${agentCmd} ) > ${outFile} 2>&1; echo $? > ${rcFile}`;
   try {
     sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
+    updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
     dbg("LAUNCHED agent in sandbox");
   } catch (err) {
     dbg(`FAIL launch: ${err.message}`);
@@ -2204,7 +2157,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       const response = filterAgentOutput(raw);
       dbg(`FILTERED response: ${response.length} bytes, first 80: "${response.slice(0, 80)}"`);
       if (response) return response;
-      if (rc !== "0") return `Agent exited with code ${rc}. ${raw.slice(0, 500)}`;
+      if (rc !== "0") return buildFriendlyFailure("sandbox", raw);
       return "(no response)";
     } catch (err) {
       // Track consecutive SSH failures — bail early if sandbox is permanently unreachable
@@ -2212,7 +2165,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       if (consecutiveFailures >= 5) {
         dbg(`BAIL ssh failed ${consecutiveFailures}x: ${err.message}`);
         try { fs.unlinkSync(confPath); } catch {}
-        return `Error: sandbox '${sandboxName}' unreachable after ${consecutiveFailures} attempts: ${err.message}`;
+        return buildFriendlyFailure("sandbox", `sandbox '${sandboxName}' unreachable after ${consecutiveFailures} attempts: ${err.message}`);
       }
       continue;
     }
@@ -2230,7 +2183,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
     if (partial) return partial + "\n\n_(timed out after 30 minutes)_";
   } catch {}
   try { fs.unlinkSync(confPath); } catch {}
-  return "Agent timed out after 30 minutes.";
+  return buildFriendlyFailure("sandbox", "timed out");
 }
 
 async function runClaudeCodeInSandbox(message, sessionId, user) {
@@ -2243,7 +2196,7 @@ async function runClaudeCodeInSandbox(message, sessionId, user) {
     sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
   } catch (err) {
     dbg(`FAIL ssh-config: ${err.message}`);
-    return `Error: Cannot reach sandbox '${sandboxName}'. Is it running?`;
+    return buildFriendlyFailure("sandbox", `Cannot reach sandbox '${sandboxName}'`);
   }
 
   const confPath = `/tmp/nemoclaw-slack-claude-${sessionId}.conf`;
@@ -2256,11 +2209,12 @@ async function runClaudeCodeInSandbox(message, sessionId, user) {
   const launchCmd = `( bash -lc '${command.replace(/'/g, "'\\''")}' ) > ${outFile} 2>&1; echo $? > ${rcFile}`;
   try {
     sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
+    updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
     dbg("LAUNCHED claude in sandbox");
   } catch (err) {
     dbg(`FAIL launch: ${err.message}`);
     try { fs.unlinkSync(confPath); } catch {}
-    return `Error launching Claude Code: ${err.message}`;
+    return buildFriendlyFailure("sandbox", `Error launching Claude Code: ${err.message}`);
   }
 
   const maxWaitMs = 3600000;
@@ -2280,13 +2234,13 @@ async function runClaudeCodeInSandbox(message, sessionId, user) {
       sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
       try { fs.unlinkSync(confPath); } catch {}
       dbg(`CLAUDE DONE rc=${rc} bytes=${raw.length}`);
-      return filterAgentOutput(raw);
+      return sanitizeUserFacingResponse(filterAgentOutput(raw) || (rc !== "0" ? raw : ""));
     } catch (err) {
       dbg(`CLAUDE poll failure: ${err.message}`);
     }
   }
   try { fs.unlinkSync(confPath); } catch {}
-  return "Claude Code timed out before completing the task.";
+  return buildFriendlyFailure("sandbox", "timed out");
 }
 
 // ── Main ──────────────────────────────────────────────────────────
@@ -2584,27 +2538,15 @@ async function main() {
         await reply("You're not registered. Ask an admin to run `nemoclaw user-add`.");
         return;
       }
-      // Load per-user Yahoo credentials from persist dir
-      const yahooCredsPath = `${REPO_DIR}/persist/users/${user.slackUserId}/credentials/yahoo-creds.env`;
-      if (!fs.existsSync(yahooCredsPath)) {
-        await reply("No Yahoo credentials configured. Ask an admin to set up `persist/users/<id>/credentials/yahoo-creds.env` with YAHOO_EMAIL and YAHOO_APP_PWD.");
-        return;
-      }
-      const yahooCreds = {};
-      fs.readFileSync(yahooCredsPath, "utf-8").split("\n").forEach((line) => {
-        const [k, ...v] = line.split("=");
-        if (k && v.length) yahooCreds[k.trim()] = v.join("=").trim();
-      });
       const yahooCmd = normalizeText(text).slice("!yahoo ".length).trim();
       // Map !yahoo subcommands to script args
       let scriptArgs;
       if (/^inbox\b/i.test(yahooCmd)) {
         const countMatch = yahooCmd.match(/--count\s+(\d+)/);
         const count = countMatch ? countMatch[1] : "10";
-        const unread = /--unread/i.test(yahooCmd) ? "--unread" : "";
-        scriptArgs = `inbox --count ${count} ${unread}`;
+        scriptArgs = ["inbox", "--count", count, ...(/\b--unread\b/i.test(yahooCmd) ? ["--unread"] : [])];
       } else if (/^read\s+(\d+)/i.test(yahooCmd)) {
-        scriptArgs = `read ${yahooCmd.match(/^read\s+(\d+)/i)[1]}`;
+        scriptArgs = ["read", yahooCmd.match(/^read\s+(\d+)/i)[1]];
       } else if (/^send\b/i.test(yahooCmd)) {
         const toMatch = yahooCmd.match(/--to\s+(\S+)/);
         const subjMatch = yahooCmd.match(/--subject\s+"([^"]+)"|--subject\s+(\S+)/);
@@ -2615,23 +2557,19 @@ async function main() {
           return;
         }
         const to = toMatch[1];
-        const subj = (subjMatch[1] || subjMatch[2]).replace(/'/g, "'\\''");
-        const body = (bodyMatch[1] || bodyMatch[2]).replace(/'/g, "'\\''");
-        scriptArgs = `send --to '${to}' --subject '${subj}' --body '${body}'`;
-        if (ccMatch) scriptArgs += ` --cc '${ccMatch[1]}'`;
+        const subj = subjMatch[1] || subjMatch[2];
+        const body = bodyMatch[1] || bodyMatch[2];
+        scriptArgs = ["send", "--to", to, "--subject", subj, "--body", body];
+        if (ccMatch) scriptArgs.push("--cc", ccMatch[1]);
       } else if (/^search\b/i.test(yahooCmd)) {
-        const query = yahooCmd.replace(/^search\s+/i, "").replace(/'/g, "'\\''");
-        scriptArgs = `search '${query}'`;
+        const query = yahooCmd.replace(/^search\s+/i, "").trim();
+        scriptArgs = ["search", query];
       } else {
         await reply("Yahoo Mail commands:\n`!yahoo inbox [--count N] [--unread]`\n`!yahoo read <message-id>`\n`!yahoo send --to <addr> --subject \"...\" --body \"...\"`\n`!yahoo search <query>`");
         return;
       }
       try {
-        const result = execFileSync("python3", [`${REPO_DIR}/scripts/yahoo-mail.py`, ...scriptArgs.split(/\s+/)], {
-          encoding: "utf-8",
-          timeout: 30000,
-          env: { ...process.env, ...yahooCreds },
-        }).trim();
+        const result = runYahooHelper(user, scriptArgs);
         await reply(result || "(no output)");
       } catch (err) {
         await reply(`Yahoo mail error: ${(err.stderr || err.message || "").slice(0, 500)}`);
@@ -2666,79 +2604,24 @@ async function main() {
     console.log(`[${channel}] ${displayName} → ${user.sandboxName}: ${effectiveText}`);
 
     try {
-      let freshreleaseEpicRequest = parseFreshreleaseEpicRequest(effectiveText);
-      let freshreleaseChildrenRequest = parseFreshreleaseChildrenRequest(effectiveText);
-      let freshreleaseIssueDetailRequest = parseFreshreleaseIssueDetailRequest(effectiveText);
-      if (requestedRetry && hasFreshreleaseCredentials(user)) {
-        const recorded = getRecordedFreshreleaseRequest(user.slackUserId);
-        if (recorded?.type === "epics") freshreleaseEpicRequest = recorded.request;
-        if (recorded?.type === "children") freshreleaseChildrenRequest = recorded.request;
-        if (recorded?.type === "issue") freshreleaseIssueDetailRequest = recorded.request;
-      }
-      if ((freshreleaseEpicRequest || freshreleaseChildrenRequest || freshreleaseIssueDetailRequest) && hasFreshreleaseCredentials(user)) {
-        const thinkingMsg = await app.client.chat.postMessage({
-          token: SLACK_BOT_TOKEN,
-          channel,
-          thread_ts: threadTs,
-          text: "Fetching Freshrelease data...",
-        });
-        try {
-          let response;
-          if (freshreleaseEpicRequest) {
-            recordFreshreleaseRequest(user.slackUserId, { type: "epics", request: freshreleaseEpicRequest });
-            response = runFreshreleaseHelper(user, freshreleaseEpicRequest.projects, {
-              FR_EPIC_LIMIT: String(freshreleaseEpicRequest.limit),
-              FR_STATUS_QUERY: freshreleaseEpicRequest.statusQuery || "",
-            });
-            response = collapseFreshreleaseTables(response);
-          } else if (freshreleaseChildrenRequest) {
-            recordFreshreleaseRequest(user.slackUserId, { type: "children", request: freshreleaseChildrenRequest });
-            response = runFreshreleaseHelper(user, ["--children", freshreleaseChildrenRequest.parentKey], {
-              FR_STATUS_QUERY: freshreleaseChildrenRequest.statusQuery || "",
-            });
-          } else {
-            recordFreshreleaseRequest(user.slackUserId, { type: "issue", request: freshreleaseIssueDetailRequest });
-            response = runFreshreleaseHelper(user, ["--issue", freshreleaseIssueDetailRequest.issueKey]);
-          }
-          response = redactSensitiveText(response, user);
-          const tablePayload = buildSlackTablePayload(response);
-          if (tablePayload) {
-            await app.client.chat.update({
-              token: SLACK_BOT_TOKEN,
-              channel,
-              ts: thinkingMsg.ts,
-              ...tablePayload,
-            });
-            return;
-          }
-          await app.client.chat.update({
-            token: SLACK_BOT_TOKEN,
-            channel,
-            ts: thinkingMsg.ts,
-            text: response.slice(0, 3800),
-          });
-        } catch (err) {
-          const detail = redactSensitiveText(`${err.stdout || ""}${err.stderr || ""}`.trim() || err.message, user);
-          await app.client.chat.update({
-            token: SLACK_BOT_TOKEN,
-            channel,
-            ts: thinkingMsg.ts,
-            text: `Freshrelease query failed: ${detail.slice(0, 800)}`,
-          });
+      let yahooRequest = parseYahooRequest(effectiveText);
+      if (!yahooRequest) {
+        const recordedEmailRequest = getRecordedEmailRequest(user.slackUserId);
+        const refinement = extractMailRefinement(effectiveText);
+        if (recordedEmailRequest && refinement) {
+          yahooRequest = { ...recordedEmailRequest, ...refinement };
         }
-        return;
       }
-
-      const googleRequest = parseGoogleRequest(effectiveText);
-      if (googleRequest && hasGoogleCredentials(user)) {
+      if (yahooRequest && hasYahooCredentials(user)) {
         const thinkingMsg = await app.client.chat.postMessage({
           token: SLACK_BOT_TOKEN,
           channel,
           thread_ts: threadTs,
-          text: "Fetching Google data...",
+          text: "Fetching email data...",
         });
         try {
-          const response = redactSensitiveText(runGoogleHelper(user, googleRequest), user);
+          recordEmailRequest(user.slackUserId, yahooRequest);
+          const response = redactSensitiveText(runEmailHelper(user, yahooRequest), user);
           const tablePayload = buildSlackTablePayload(response);
           if (tablePayload) {
             await app.client.chat.update({
@@ -2757,11 +2640,12 @@ async function main() {
           }
         } catch (err) {
           const detail = redactSensitiveText(`${err.stdout || ""}${err.stderr || ""}`.trim() || err.message, user);
+          console.error(`[email] ${detail}`);
           await app.client.chat.update({
             token: SLACK_BOT_TOKEN,
             channel,
             ts: thinkingMsg.ts,
-            text: `Google query failed: ${detail.slice(0, 800)}`,
+            text: buildFriendlyFailure("Email", detail),
           });
         }
         return;
@@ -2785,6 +2669,7 @@ async function main() {
         thinkingTs: thinkingMsg.ts,
         displayName,
         slackUserId: event.user,
+        state: "launching",
       });
 
       let response = await enqueueForUser(user.sandboxName, async () => {
@@ -2847,7 +2732,7 @@ async function main() {
       }
 
       // Convert markdown to Slack format, then build table blocks
-      response = redactSensitiveText(response, user);
+      response = sanitizeUserFacingResponse(redactSensitiveText(response, user));
       response = mdToSlack(mdLinksToSlack(response));
       const tablePayload = buildSlackTablePayload(response);
       if (tablePayload) {
@@ -2872,13 +2757,14 @@ async function main() {
       // Remove from pending runs — delivery succeeded
       removePendingRun(agentSessionId);
     } catch (err) {
+      removePendingRun(agentSessionId);
       console.error(`[${channel}] error for ${displayName}:`, err.message);
       // Redact auth errors in public channels
       const errMsg = err.message || "";
       const isAuthErr = /authentication_error|invalid_grant|Invalid authentication|401.*auth/i.test(errMsg);
       const safeMsg = (!isDM && isAuthErr)
         ? "I'm having a temporary issue — please try again in a few minutes or DM me directly."
-        : `Error: ${errMsg}`;
+        : buildFriendlyFailure("request", errMsg);
       await say({ text: safeMsg, thread_ts: threadTs });
     }
   }
@@ -2935,23 +2821,18 @@ module.exports = {
   parseShowClawsOptions,
   filterAndSortClawInventory,
   formatClawInventory,
-  parseFreshreleaseEpicRequest,
-  parseFreshreleaseChildrenRequest,
-  parseFreshreleaseIssueDetailRequest,
-  parseFreshreleaseStatusQuery,
-  extractFreshreleaseProjects,
   isRetryCommand,
-  hasFreshreleaseCredentials,
-  hasGoogleCredentials,
-  parseGoogleRequest,
-  runFreshreleaseEpicHelper,
-  runFreshreleaseHelper,
-  runGoogleHelper,
+  hasYahooCredentials,
+  parseYahooRequest,
+  extractMailRefinement,
+  runYahooHelper,
   collapseFreshreleaseTables,
   redactSensitiveText,
+  sanitizeUserFacingResponse,
   recordLastUserRequest,
   getRecordedLastUserRequest,
   getPendingRunAgeMs,
+  shouldExpireLaunchingPendingRun,
   shouldExpirePendingRun,
   shouldDropPendingRun,
   shouldUseDirectClaudeCode,

@@ -130,31 +130,38 @@ describe("slack-bridge-multi helpers", () => {
     expect(cmd).toContain("export NEMOCLAW_GITHUB_USER='alicehub'");
   });
 
-  it("extracts Freshrelease project keys generically", () => {
-    expect(bridge.extractFreshreleaseProjects("get 5 active epics from BILLING, SEARCH, FRESHID")).toEqual(["BILLING", "SEARCH", "FRESHID"]);
-    expect(bridge.extractFreshreleaseProjects("show details for COREAPP-1234")).toEqual(["COREAPP"]);
+  it("parses generic email requests for Yahoo helper routing", () => {
+    expect(bridge.parseYahooRequest("get pending personal tasks")).toBeNull();
+    expect(bridge.parseYahooRequest("emails from my cpa")).toEqual({
+      kind: "search",
+      query: "my cpa",
+      count: 10,
+      year: null,
+    });
+    expect(bridge.parseYahooRequest("show 5 unread emails")).toEqual({
+      kind: "inbox",
+      count: 5,
+      unread: true,
+      year: null,
+    });
+    expect(bridge.parseYahooRequest("unable to pull email")).toEqual({
+      kind: "inbox",
+      count: 10,
+      unread: false,
+      year: null,
+    });
+    expect(bridge.parseYahooRequest("show cpa emails from this year")).toEqual({
+      kind: "search",
+      query: "cpa",
+      count: 10,
+      year: 2026,
+    });
   });
 
-  it("parses generic Google requests", () => {
-    expect(bridge.parseGoogleRequest("list my personal tasks on google calendar")).toEqual({
-      kind: "tasks",
-      limit: 5,
-      status: "open",
-      listQuery: "",
-      preferPersonal: true,
-    });
-    expect(bridge.parseGoogleRequest("get from Freshworks tasks")).toEqual({
-      kind: "tasks",
-      limit: 5,
-      status: "open",
-      listQuery: "freshworks",
-      preferPersonal: false,
-    });
-    expect(bridge.parseGoogleRequest("show 10 google calendar events this week")).toEqual({
-      kind: "calendar",
-      limit: 10,
-      range: "week",
-    });
+  it("extracts email refinements from short follow-up prompts", () => {
+    expect(bridge.extractMailRefinement("this year is 2026")).toEqual({ year: 2026 });
+    expect(bridge.extractMailRefinement("for 2025")).toEqual({ year: 2025 });
+    expect(bridge.extractMailRefinement("thanks")).toBeNull();
   });
 
   it("builds admin users from roles and allowlist-only entries", () => {
@@ -212,16 +219,18 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
     const credentialsDir = path.join(tempRoot, "credentials");
     fs.mkdirSync(path.join(credentialsDir, "gogcli"), { recursive: true });
     fs.writeFileSync(path.join(credentialsDir, "gh-hosts.yml"), "github.com:\n");
-    fs.writeFileSync(path.join(credentialsDir, "freshrelease-api-key.txt"), "x");
     fs.writeFileSync(path.join(credentialsDir, "gogcli", "config.json"), "{}");
 
     const configured = bridge.listConfiguredCredentials({ credentialsDir });
 
-    expect(configured).toEqual(["GitHub", "Google (gogcli)", "Freshrelease"]);
+    expect(configured).toEqual(["GitHub", "Google (gogcli)"]);
   });
 
   it("expires and drops stale pending runs by age", () => {
     const now = 1_000_000;
+    expect(bridge.shouldExpireLaunchingPendingRun({ startedAt: now - (3 * 60 * 1000), state: "launching" }, now)).toBe(true);
+    expect(bridge.shouldExpireLaunchingPendingRun({ startedAt: now - (30 * 1000), state: "launching" }, now)).toBe(false);
+    expect(bridge.shouldExpireLaunchingPendingRun({ startedAt: now - (3 * 60 * 1000), state: "running" }, now)).toBe(false);
     expect(bridge.shouldExpirePendingRun({ startedAt: now - (21 * 60 * 1000) }, now)).toBe(true);
     expect(bridge.shouldExpirePendingRun({ startedAt: now - (5 * 60 * 1000) }, now)).toBe(false);
     expect(bridge.shouldDropPendingRun({ startedAt: now - (7 * 60 * 60 * 1000) }, now)).toBe(true);
@@ -343,47 +352,6 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
     expect(payload).toHaveProperty("text");
   });
 
-  it("detects Freshrelease epic shortcut requests", () => {
-    expect(bridge.parseFreshreleaseEpicRequest("get 3 most active EPICs from BILLING, SEARCH, FRESHID")).toEqual({
-      projects: ["BILLING", "SEARCH", "FRESHID"],
-      limit: 3,
-      statusQuery: "",
-    });
-    expect(bridge.parseFreshreleaseEpicRequest("show top 5 epics for billing")).toEqual({
-      projects: ["BILLING"],
-      limit: 5,
-      statusQuery: "",
-    });
-    expect(bridge.parseFreshreleaseEpicRequest("list stories in BILLING")).toBeNull();
-  });
-
-  it("detects Freshrelease child-story and issue-detail requests", () => {
-    expect(bridge.parseFreshreleaseChildrenRequest("get all stories under BILLING-10505")).toEqual({
-      parentKey: "BILLING-10505",
-      statusQuery: "",
-    });
-    expect(bridge.parseFreshreleaseChildrenRequest("list issues under SEARCH-4091")).toEqual({
-      parentKey: "SEARCH-4091",
-      statusQuery: "",
-    });
-    expect(bridge.parseFreshreleaseIssueDetailRequest("get full details for BILLING-10505")).toEqual({
-      issueKey: "BILLING-10505",
-    });
-    expect(bridge.parseFreshreleaseIssueDetailRequest("details for SEARCH-4091")).toEqual({
-      issueKey: "SEARCH-4091",
-    });
-  });
-
-  it("detects natural-language Freshrelease state filters", () => {
-    expect(bridge.parseFreshreleaseStatusQuery("get all open stories under BILLING-10505")).toBe("open");
-    expect(bridge.parseFreshreleaseStatusQuery("show ready to test stories under BILLING-10505")).toBe("ready to test");
-    expect(bridge.parseFreshreleaseEpicRequest("get 3 open epics from BILLING")).toEqual({
-      projects: ["BILLING"],
-      limit: 3,
-      statusQuery: "open",
-    });
-  });
-
   it("recognizes retry commands", () => {
     expect(bridge.isRetryCommand("retry")).toBe(true);
     expect(bridge.isRetryCommand("try again")).toBe(true);
@@ -394,31 +362,23 @@ bob-claw      openshell  2026-03-28 10:05:00  Pending
   });
 
   it("redacts sensitive values from responses", () => {
-    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-freshrelease-redact-"));
-    const credentialsDir = path.join(tempRoot, "credentials");
-    fs.mkdirSync(credentialsDir, { recursive: true });
-    fs.writeFileSync(path.join(credentialsDir, "freshrelease-api-key.txt"), "secret-token-123");
-    const text = bridge.redactSensitiveText("API key: secret-token-123\nAuthorization: Token secret-token-123", {
+    const text = bridge.redactSensitiveText("token sk-ant-secret-value", {
       slackUserId: "U1",
-      credentialsDir,
+      credentialsDir: path.join(os.tmpdir(), "unused-creds"),
     });
-    expect(text).not.toContain("secret-token-123");
+    expect(text).not.toContain("sk-ant-secret-value");
     expect(text).toContain("[REDACTED]");
+  });
+
+  it("converts raw sandbox/bootstrap failures into friendly user-facing text", () => {
+    const text = bridge.sanitizeUserFacingResponse("Agent exited with code 1. [SECURITY] CAP_SETPCAP not available\nSetting up NemoClaw...");
+    expect(text).toBe("I couldn't complete that request in the sandbox. Please try again.");
   });
 
   it("records and reuses the last non-retry user request", () => {
     bridge.recordLastUserRequest("U-last", "list my git repos changed this month");
     bridge.recordLastUserRequest("U-last", "retry");
     expect(bridge.getRecordedLastUserRequest("U-last")).toBe("list my git repos changed this month");
-  });
-
-  it("detects Freshrelease credentials from the user credential directory", () => {
-    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-freshrelease-"));
-    const credentialsDir = path.join(tempRoot, "credentials");
-    fs.mkdirSync(credentialsDir, { recursive: true });
-    expect(bridge.hasFreshreleaseCredentials({ slackUserId: "U1", credentialsDir })).toBe(false);
-    fs.writeFileSync(path.join(credentialsDir, "freshrelease-api-key.txt"), "token");
-    expect(bridge.hasFreshreleaseCredentials({ slackUserId: "U1", credentialsDir })).toBe(true);
   });
 
   it("collapses multi-project Freshrelease output into one markdown table", () => {

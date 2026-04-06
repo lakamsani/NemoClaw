@@ -144,6 +144,8 @@ if os.path.exists(path):
     cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
     json.dump(cfg, open(path, 'w'), indent=2)
     os.chmod(path, 0o600)
+    import subprocess
+    subprocess.run(['sha256sum', path], check=True, stdout=open(os.path.expanduser('~/.openclaw/.config-hash'), 'w'))
 `;
       const scriptB64 = Buffer.from(patchScript).toString("base64");
       sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");
@@ -190,6 +192,8 @@ if os.path.exists(path):
     cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
     json.dump(cfg, open(path, 'w'), indent=2)
     os.chmod(path, 0o600)
+    import subprocess
+    subprocess.run(['sha256sum', path], check=True, stdout=open(os.path.expanduser('~/.openclaw/.config-hash'), 'w'))
 `;
     const scriptB64 = Buffer.from(patchScript).toString("base64");
     sshPipe(user.sandboxName, scriptB64 + "\n", "base64 -d | python3");

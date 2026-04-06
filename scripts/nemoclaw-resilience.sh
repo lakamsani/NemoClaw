@@ -338,6 +338,8 @@ providers['anthropic']['apiKey'] = '${ANTHROPIC_API_KEY}'
 cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'anthropic/claude-sonnet-4-6'
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
+import subprocess
+subprocess.run(['sha256sum', path], check=True, stdout=open(os.path.expanduser('~/.openclaw/.config-hash'), 'w'))
 
 # Write auth profiles
 profiles = {}
@@ -363,6 +365,8 @@ gw['auth'] = {'mode': 'token', 'token': '${GATEWAY_TOKEN}'}
 gw['controlUi'] = {'allowInsecureAuth': True, 'dangerouslyDisableDeviceAuth': True, 'allowedOrigins': ['http://127.0.0.1:18789', 'http://localhost:18789']}
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
+import subprocess
+subprocess.run(['sha256sum', path], check=True, stdout=open(os.path.expanduser('~/.openclaw/.config-hash'), 'w'))
 \"" 2>/dev/null
 info "Gateway auth token set"
 
@@ -431,6 +435,8 @@ cfg = json.load(open(path))
 cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = '${PM}'
 json.dump(cfg, open(path, 'w'), indent=2)
 os.chmod(path, 0o600)
+import subprocess
+subprocess.run(['sha256sum', path], check=True, stdout=open(os.path.expanduser('~/.openclaw/.config-hash'), 'w'))
 \"" 2>/dev/null && info "Primary model re-applied: $PM"
 fi
 ssh_cmd 'rm -f /sandbox/.openclaw/agents/main/agent/*.tmp' 2>/dev/null || true
@@ -480,6 +486,18 @@ if [ -f "$WHEELS_TAR" ]; then
   else
     info "freshrelease-mcp already installed ($CURRENT_FR)"
   fi
+fi
+
+# ── Step 6d: Install mcporter when Freshrelease MCP is configured ──
+if [ -n "$CRED_DIR" ] && [ -f "$CRED_DIR/freshrelease-api-key.txt" ]; then
+  CURRENT_MCPORTER="$(ssh_cmd 'export PATH=/sandbox/.local/bin:$PATH; mcporter --version 2>/dev/null || true' 2>/dev/null)"
+  if [ -z "$CURRENT_MCPORTER" ]; then
+    ssh_cmd 'npm install -g --prefix /sandbox/.local mcporter >/tmp/mcporter-install.log 2>&1 && tail -n 2 /tmp/mcporter-install.log'
+    info "mcporter installed for Freshrelease MCP access"
+  else
+    info "mcporter already installed ($CURRENT_MCPORTER)"
+  fi
+  ssh_cmd 'pip3 install --break-system-packages httpx>=0.28.1 mcp>=1.3.0 pydantic>=2.10.6 >/tmp/freshrelease-mcp-deps.log 2>&1 || tail -n 20 /tmp/freshrelease-mcp-deps.log' || true
 fi
 
 # ── Step 7: Restore cron jobs ──────────────────────────────────

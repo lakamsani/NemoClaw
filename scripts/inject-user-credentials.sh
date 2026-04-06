@@ -141,23 +141,34 @@ if [ -f "$CRED_DIR/claude-settings.json" ]; then
   info "Claude settings injected (per-user)"
 fi
 
-# ── Freshrelease API key (injected into sandbox .env for direct curl access) ──
+# ── Freshrelease API key (injected into sandbox .env and mcporter MCP config) ──
 if [ -f "$CRED_DIR/freshrelease-api-key.txt" ]; then
   FR_KEY="$(cat "$CRED_DIR/freshrelease-api-key.txt" | tr -d '[:space:]')"
   ssh_cmd "grep -q FRESHRELEASE_API_KEY /sandbox/.env 2>/dev/null && sed -i 's|^FRESHRELEASE_API_KEY=.*|FRESHRELEASE_API_KEY=${FR_KEY}|' /sandbox/.env || echo 'FRESHRELEASE_API_KEY=${FR_KEY}' >> /sandbox/.env; chmod 600 /sandbox/.env"
-  # Also remove any leftover MCP config from claude settings
+  ssh_cmd "mkdir -p /sandbox/.mcporter /sandbox/.local/bin"
   ssh_cmd "python3 -c \"
 import json, os
-path = '/sandbox/.claude/settings.json'
-if not os.path.exists(path): exit(0)
-cfg = json.load(open(path))
-mcp = cfg.get('mcpServers', {})
-if 'freshrelease' in mcp:
-    del mcp['freshrelease']
-    json.dump(cfg, open(path, 'w'), indent=4)
-    os.chmod(path, 0o600)
+path = '/sandbox/.mcporter/mcporter.json'
+cfg = {}
+if os.path.exists(path):
+    cfg = json.load(open(path))
+mcp = cfg.setdefault('mcpServers', {})
+mcp['freshrelease'] = {
+    'transport': 'stdio',
+    'command': '/usr/local/bin/freshrelease-mcp',
+    'args': [],
+    'env': {
+        'FRESHRELEASE_DOMAIN': 'freshworks.freshrelease.com',
+        'FRESHRELEASE_API_KEY': '${FR_KEY}',
+        'NO_PROXY': 'localhost,127.0.0.1,::1,10.200.0.1,freshworks.freshrelease.com',
+        'no_proxy': 'localhost,127.0.0.1,::1,10.200.0.1,freshworks.freshrelease.com'
+    },
+    'description': 'Freshrelease MCP server'
+}
+json.dump(cfg, open(path, 'w'), indent=2)
+os.chmod(path, 0o644)
 \"" 2>/dev/null
-  info "Freshrelease API key injected into .env (direct REST access)"
+  info "Freshrelease API key injected into .env and mcporter MCP config"
 fi
 
 # ── Claude MCP auth cache ────────────────────────────────────────
