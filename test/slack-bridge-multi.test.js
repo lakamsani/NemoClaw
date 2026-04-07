@@ -111,6 +111,24 @@ describe("slack-bridge-multi helpers", () => {
     expect(cmd).toContain("User request: open a PR after tests pass");
   });
 
+  it("detects long coding requests for isolated Claude jobs", () => {
+    expect(bridge.isLikelyLongCodingRequest("resolve https://github.com/lakamsani/fare-finder/issues/14")).toBe(true);
+    expect(bridge.isLikelyLongCodingRequest("migrate it to Go")).toBe(true);
+    expect(bridge.isLikelyLongCodingRequest("what programming language is https://github.com/lakamsani/fare-finder")).toBe(false);
+    expect(bridge.isLikelyLongCodingRequest("merge and close that PR")).toBe(false);
+  });
+
+  it("builds isolated Claude job commands with foreground execution", () => {
+    const cmd = bridge.buildClaudeJobCommand("resolve issue 14", {
+      slackUserId: "U1",
+      slackDisplayName: "Alice",
+    });
+    expect(cmd).toContain("claude --permission-mode bypassPermissions --print");
+    expect(cmd).toContain("This is a foreground coding job launched for a Slack user request.");
+    expect(cmd).toContain("User request: resolve issue 14");
+    expect(cmd).toContain("cd /sandbox/.openclaw/workspace");
+  });
+
   it("keeps only the final completion block from long coding transcripts", () => {
     const raw = `
 Now let me fetch the issue details and start the fix.

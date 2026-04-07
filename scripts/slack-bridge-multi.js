@@ -88,6 +88,44 @@ function enqueueForUser(sandboxName, fn) {
   return next;
 }
 
+function isLikelyLongCodingRequest(text) {
+  const normalized = normalizeText(text).toLowerCase();
+  if (!normalized) return false;
+  if (/^merge and close\b|^close that pr\b|^what programming language\b|^show all my git repos\b|^list all my git repos\b/.test(normalized)) {
+    return false;
+  }
+  return (
+    /(fix|resolve|implement|migrate|port)\b/.test(normalized) ||
+    /\b(run tests?|open (a )?pr|pull request|commit|push|refactor|build)\b/.test(normalized) ||
+    /github\.com\/.+\/(issues|pull)\//.test(normalized)
+  );
+}
+
+async function postThreadResult(slackClient, channel, threadTs, thinkingTs, response, placeholderText = "Completed.") {
+  const tablePayload = buildSlackTablePayload(response);
+  await slackClient.chat.update({
+    token: SLACK_BOT_TOKEN,
+    channel,
+    ts: thinkingTs,
+    text: placeholderText,
+  });
+  if (tablePayload) {
+    await slackClient.chat.postMessage({
+      token: SLACK_BOT_TOKEN,
+      channel,
+      thread_ts: threadTs,
+      ...tablePayload,
+    });
+  } else {
+    await slackClient.chat.postMessage({
+      token: SLACK_BOT_TOKEN,
+      channel,
+      thread_ts: threadTs,
+      text: mdToSlack(mdLinksToSlack(response)),
+    });
+  }
+}
+
 function sh(value) {
   return String(value).replace(/'/g, "'\\''");
 }
@@ -1307,6 +1345,30 @@ function buildAgentCommand(message, sessionId, user, options = {}) {
   return scriptLines.join("\n");
 }
 
+function buildClaudeJobCommand(message, user) {
+  const prompt = [
+    "Slack execution rules:",
+    "- This is a foreground coding job launched for a Slack user request.",
+    "- Complete the requested work end to end before returning.",
+    "- If you create a PR, include the final PR URL in the last paragraph.",
+    "- If blocked, report the concrete blocker in the final paragraph.",
+    "",
+    `Slack user: ${user.slackDisplayName || user.slackUserId}`,
+    `User request: ${message}`,
+  ].join("\n");
+  const escaped = prompt.replace(/'/g, "'\\''");
+  return [
+    `export NVIDIA_API_KEY='${sh(API_KEY)}'`,
+    `export OPENAI_API_KEY='${sh(API_KEY)}'`,
+    `export NEMOCLAW_SLACK_USER_ID='${sh(user.slackUserId)}'`,
+    `export NEMOCLAW_SLACK_DISPLAY_NAME='${sh(user.slackDisplayName || user.slackUserId)}'`,
+    "export NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache",
+    "source /sandbox/.bashrc 2>/dev/null",
+    "cd /sandbox/.openclaw/workspace",
+    `claude --permission-mode bypassPermissions --print '${escaped}'`,
+  ].join("\n");
+}
+
 function syncSandboxSelectionConfig(user, provider, model) {
   const selectionConfig = getProviderSelectionConfig(provider, model);
   if (!selectionConfig) return;
@@ -1963,12 +2025,7 @@ async function recoverOrphanedRuns(slackClient) {
 
       const response = filterAgentOutput(raw);
       if (response && info.channel && info.thinkingTs) {
-        const tablePayload = buildSlackTablePayload(response);
-        if (tablePayload) {
-          await slackClient.chat.update({ token: SLACK_BOT_TOKEN, channel: info.channel, ts: info.thinkingTs, ...tablePayload });
-        } else {
-          await slackClient.chat.update({ token: SLACK_BOT_TOKEN, channel: info.channel, ts: info.thinkingTs, text: response });
-        }
+        await postThreadResult(slackClient, info.channel, info.threadTs || info.channel, info.thinkingTs, response, "Recovered result posted.");
         console.log(`[recovery] Delivered orphaned result for ${info.displayName}: ${response.slice(0, 80)}...`);
         recovered++;
       }
@@ -2092,6 +2149,40 @@ function getRemoteFileStat(confPath, sandboxName, filePath) {
   return { size, mtimeMs };
 }
 
+function getRemoteSessionActivity(confPath, sandboxName, agentId = "main") {
+  const raw = sshExec(
+    confPath,
+    sandboxName,
+    `python3 - <<'PY'
+import json
+from pathlib import Path
+path = Path('/sandbox/.openclaw-data/agents/${agentId}/sessions/sessions.json')
+if not path.exists():
+    print('__missing__')
+    raise SystemExit(0)
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    print('__missing__')
+    raise SystemExit(0)
+entry = data.get('agent:${agentId}:main') or {}
+updated = entry.get('updatedAt')
+session_id = entry.get('sessionId') or ''
+if isinstance(updated, (int, float)):
+    print(f"{int(updated)} {session_id}")
+else:
+    print('__missing__')
+PY`,
+    10000,
+  );
+  if (!raw || raw === "__missing__") return null;
+  const parts = raw.trim().split(/\s+/);
+  const updatedAt = Number.parseInt(parts[0], 10);
+  const sessionId = parts.slice(1).join(" ");
+  if (!Number.isFinite(updatedAt)) return null;
+  return { updatedAt, sessionId };
+}
+
 async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const sandboxName = user.sandboxName;
   const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
@@ -2114,18 +2205,45 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
 
   const agentCmd = buildAgentCommand(message, sessionId, user, options);
+  updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
+  return runSandboxCommand(confPath, sandboxName, outFile, rcFile, agentCmd, dbg, { trackSessionActivity: true });
+}
 
+async function runClaudeJobInSandbox(message, sessionId, user) {
+  const sandboxName = user.sandboxName;
+  const dbg = (msg) => console.log(`[debug:${sessionId.slice(-12)}] ${msg}`);
+  dbg(`START claude-job sandbox=${sandboxName} msg="${message.slice(0, 60)}..."`);
+
+  let sshConfig;
+  try {
+    sshConfig = execSync(`"${OPENSHELL}" sandbox ssh-config "${sandboxName}"`, { encoding: "utf-8" });
+  } catch (err) {
+    dbg(`FAIL ssh-config: ${err.message}`);
+    return `Error: Cannot reach sandbox '${sandboxName}'. Is it running?`;
+  }
+
+  const confPath = `/tmp/nemoclaw-slack-ssh-${sessionId}.conf`;
+  fs.writeFileSync(confPath, sshConfig);
+
+  const tag = `slack-${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const outFile = `/tmp/nemoclaw-agent-${tag}.out`;
+  const rcFile = `/tmp/nemoclaw-agent-${tag}.rc`;
+
+  updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
+  return runSandboxCommand(confPath, sandboxName, outFile, rcFile, buildClaudeJobCommand(message, user), dbg, { trackSessionActivity: false });
+}
+
+async function runSandboxCommand(confPath, sandboxName, outFile, rcFile, command, dbg, options = {}) {
   // Fire: launch agent in background, redirect output to file, always attempt to write rc on shell exit.
   const launchCmd = [
     "status=124",
     `trap 'printf \"%s\\n\" \"${"${status:-1}"}\" > ${rcFile}' EXIT`,
-    `( ${agentCmd} ) > ${outFile} 2>&1`,
+    `( ${command} ) > ${outFile} 2>&1`,
     "status=$?",
     "exit $status",
   ].join("; ");
   try {
     sshExec(confPath, sandboxName, `nohup sh -c '${launchCmd.replace(/'/g, "'\\''")}' </dev/null >/dev/null 2>&1 &`, 15000);
-    updatePendingRun(sessionId, { state: "running", launchConfirmedAt: Date.now() });
     dbg("LAUNCHED agent in sandbox");
   } catch (err) {
     dbg(`FAIL launch: ${err.message}`);
@@ -2141,6 +2259,8 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
   let pollCount = 0;
   let lastOutputStat = null;
   let lastOutputProgressAt = startTime;
+  let lastSessionUpdatedAt = 0;
+  let lastSessionProgressAt = startTime;
   dbg(`STALL threshold ${Math.round(STARTUP_STALL_MS / 1000)}s without output progress`);
 
   while (Date.now() - startTime < maxWaitMs) {
@@ -2151,6 +2271,7 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
       consecutiveFailures = 0;
       if (rc === "__pending__") {
         const currentStat = getRemoteFileStat(confPath, sandboxName, outFile);
+        const sessionActivity = options.trackSessionActivity ? getRemoteSessionActivity(confPath, sandboxName, "main") : null;
         if (currentStat && (!lastOutputStat
           || currentStat.size !== lastOutputStat.size
           || currentStat.mtimeMs !== lastOutputStat.mtimeMs)) {
@@ -2158,7 +2279,13 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
           lastOutputStat = currentStat;
           dbg(`OUTPUT progress size=${currentStat.size} at ${Math.round((Date.now() - startTime) / 1000)}s`);
         }
-        if (currentStat && Date.now() - lastOutputProgressAt >= STARTUP_STALL_MS) {
+        if (sessionActivity && sessionActivity.updatedAt > lastSessionUpdatedAt) {
+          lastSessionUpdatedAt = sessionActivity.updatedAt;
+          lastSessionProgressAt = Date.now();
+          dbg(`SESSION progress updatedAt=${sessionActivity.updatedAt} session=${sessionActivity.sessionId || "(unknown)"}`);
+        }
+        const lastProgressAt = Math.max(lastOutputProgressAt, lastSessionProgressAt);
+        if (currentStat && Date.now() - lastProgressAt >= STARTUP_STALL_MS) {
           const raw = sshExec(confPath, sandboxName, `cat ${outFile} 2>/dev/null`, 15000);
           if (/session file locked/i.test(raw)) {
             dbg("LOCK timeout detected while waiting for startup output");
@@ -2168,14 +2295,14 @@ async function runAgentInSandbox(message, sessionId, user, options = {}) {
           }
           const partial = filterAgentOutput(raw);
           if (!partial) {
-            dbg(`STALL no progress for ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s (elapsed ${Math.round((Date.now() - startTime) / 1000)}s)`);
+            dbg(`STALL no progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s (elapsed ${Math.round((Date.now() - startTime) / 1000)}s)`);
             sshExec(confPath, sandboxName, `rm -f ${outFile} ${rcFile} 2>/dev/null`, 5000);
             try { fs.unlinkSync(confPath); } catch {}
             return buildFriendlyFailure("sandbox", "startup stalled before producing a response");
           }
         }
         if (pollCount % 20 === 0) {
-          dbg(`POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed, last output ${Math.round((Date.now() - lastOutputProgressAt) / 1000)}s ago)`);
+          dbg(`POLLING #${pollCount} (${Math.round((Date.now() - startTime) / 1000)}s elapsed, last progress ${Math.round((Date.now() - lastProgressAt) / 1000)}s ago)`);
         }
         continue;
       }
@@ -2603,31 +2730,11 @@ async function main() {
         try {
           recordEmailRequest(user.slackUserId, yahooRequest);
           const response = redactSensitiveText(runEmailHelper(user, yahooRequest), user);
-          const tablePayload = buildSlackTablePayload(response);
-          if (tablePayload) {
-            await app.client.chat.update({
-              token: SLACK_BOT_TOKEN,
-              channel,
-              ts: thinkingMsg.ts,
-              ...tablePayload,
-            });
-          } else {
-            await app.client.chat.update({
-              token: SLACK_BOT_TOKEN,
-              channel,
-              ts: thinkingMsg.ts,
-              text: response.slice(0, 3800),
-            });
-          }
+          await postThreadResult(app.client, channel, threadTs, thinkingMsg.ts, response, "Email results posted.");
         } catch (err) {
           const detail = redactSensitiveText(`${err.stdout || ""}${err.stderr || ""}`.trim() || err.message, user);
           console.error(`[email] ${detail}`);
-          await app.client.chat.update({
-            token: SLACK_BOT_TOKEN,
-            channel,
-            ts: thinkingMsg.ts,
-            text: buildFriendlyFailure("Email", detail),
-          });
+          await postThreadResult(app.client, channel, threadTs, thinkingMsg.ts, buildFriendlyFailure("Email", detail), "Email request failed.");
         }
         return;
       }
@@ -2647,11 +2754,36 @@ async function main() {
       addPendingRun(agentSessionId, {
         sandboxName: user.sandboxName,
         channel,
+        threadTs,
         thinkingTs: thinkingMsg.ts,
         displayName,
         slackUserId: event.user,
         state: "launching",
       });
+
+      if (isLikelyLongCodingRequest(effectiveText)) {
+        await app.client.chat.update({
+          token: SLACK_BOT_TOKEN,
+          channel,
+          ts: thinkingMsg.ts,
+          text: "Queued isolated Claude coding job. I’ll post the result here when it finishes.",
+        });
+        void (async () => {
+          try {
+            let response = await runClaudeJobInSandbox(effectiveText, agentSessionId, user);
+            console.log(`[${channel}] ${user.sandboxName} → ${displayName} (claude job): ${response.slice(0, 100)}...`);
+            response = sanitizeUserFacingResponse(redactSensitiveText(response, user));
+            await postThreadResult(app.client, channel, threadTs, thinkingMsg.ts, response, "Claude job completed.");
+            if (isDM) maybeForwardToWhatsApp(user, response);
+          } catch (err) {
+            console.error(`[${channel}] isolated claude job error for ${displayName}:`, err.message);
+            await postThreadResult(app.client, channel, threadTs, thinkingMsg.ts, buildFriendlyFailure("request", err.message || "Claude job failed"), "Claude job failed.");
+          } finally {
+            removePendingRun(agentSessionId);
+          }
+        })();
+        return;
+      }
 
       let response = await enqueueForUser(user.sandboxName, async () => {
         // Wait for rate limit cooldown before launching
@@ -2712,23 +2844,7 @@ async function main() {
 
       // Convert markdown to Slack format, then build table blocks
       response = sanitizeUserFacingResponse(redactSensitiveText(response, user));
-      response = mdToSlack(mdLinksToSlack(response));
-      const tablePayload = buildSlackTablePayload(response);
-      if (tablePayload) {
-        await app.client.chat.update({
-          token: SLACK_BOT_TOKEN,
-          channel,
-          ts: thinkingMsg.ts,
-          ...tablePayload,
-        });
-      } else {
-        await app.client.chat.update({
-          token: SLACK_BOT_TOKEN,
-          channel,
-          ts: thinkingMsg.ts,
-          text: mdToSlack(mdLinksToSlack(response)),
-        });
-      }
+      await postThreadResult(app.client, channel, threadTs, thinkingMsg.ts, response);
 
       // Forward notification-like responses to WhatsApp
       if (isDM) maybeForwardToWhatsApp(user, response);
@@ -2831,6 +2947,9 @@ module.exports = {
   describeClaudeCredentialSource,
   buildAuthRecoveryMessage,
   buildAgentCommand,
+  buildClaudeJobCommand,
+  isLikelyLongCodingRequest,
   runAgentInSandbox,
+  runClaudeJobInSandbox,
   getRuntimeFallbackModels,
 };

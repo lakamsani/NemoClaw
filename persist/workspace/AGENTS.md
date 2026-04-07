@@ -55,6 +55,12 @@ You're a participant, not the user's proxy. Reply when you add value. Stay quiet
 
 Skills provide specialized workflows. Use `TOOLS.md` for tool preferences and local operational rules.
 
+## Language Migration Rules
+
+- For any migration or port to Java, use Gradle only.
+- Do not introduce Maven files, Maven wrapper files, or `pom.xml`.
+- If Java build tooling is needed, create or update Gradle files (`build.gradle`, `build.gradle.kts`, `settings.gradle`, `gradlew`, `gradle/wrapper/*`) instead of Maven equivalents.
+
 ## Heartbeats
 
 When a heartbeat poll arrives, read `HEARTBEAT.md` and follow it. If nothing needs attention, reply `HEARTBEAT_OK`.

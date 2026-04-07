@@ -4,9 +4,9 @@
 
 This deployment runs one claw per user inside isolated OpenShell sandboxes and exposes them primarily through Slack, with WhatsApp and host-side mail helpers where sandbox egress is not a good fit.
 
-The current baseline is Anthropic-managed. The bridge owns Slack routing, admin commands, self-service credential setup, per-user queueing, pending-run recovery, and response filtering. The sandbox fleet owns user workspace state, in-sandbox tools such as `gog` and Freshrelease MCP, and foreground coding work through the default OpenClaw `main` agent.
+The current baseline is Anthropic-managed. The bridge owns Slack routing, admin commands, self-service credential setup, queued foreground runs for normal prompts, isolated background Claude jobs for long coding tasks, pending-run recovery, and response filtering. The sandbox fleet owns user workspace state, in-sandbox tools such as `gog` and Freshrelease MCP, and the repo work performed by the default OpenClaw `main` agent or isolated Claude processes.
 
-**Current status:** the active shape of the system is a DM-only Slack bridge with direct admin commands, shared runtime policy in repo config, per-user credential injection, recoverable add/delete flows, and a simplified Slack execution path that launches the sandbox `main` agent directly.
+**Current status:** the active shape of the system is a DM-only Slack bridge with direct admin commands, shared runtime policy in repo config, per-user credential injection, recoverable add/delete flows, queued `main` agent execution for normal prompts, isolated concurrent Claude coding jobs for long repo work, and new in-thread Slack completion messages instead of final placeholder edits.
 
 ---
 
@@ -23,20 +23,22 @@ The current baseline is Anthropic-managed. The bridge owns Slack routing, admin 
 Slack App / WhatsApp
     │
     ▼
-Slack bridge / WhatsApp bridge  ── per-user queue ── pending-run recovery ── admin audit
+Slack bridge / WhatsApp bridge  ── queued foreground runs + isolated coding jobs ── pending-run recovery ── admin audit
     │
     ├── Host-side control plane
     │     ├── self-service !setup credential handling
     │     ├── add/delete/purge/show admin commands
     │     ├── Yahoo / email-query helpers
     │     ├── WhatsApp bridge helpers
-    │     └── rate-limit cooldown + inference fallback routing
+    │     ├── rate-limit cooldown + inference fallback routing
+    │     └── new-message Slack completion delivery
     │
     └── OpenShell sandboxes
           ├── one sandbox per user
           ├── shared workspace defaults + per-user credentials
           ├── in-sandbox Freshrelease MCP and Google gog access
-          └── foreground coding work through the sandbox main agent
+          ├── foreground OpenClaw `main` agent for normal prompts
+          └── isolated background Claude jobs for long coding work
 
 Shared control files:
   ~/.nemoclaw/users.json
@@ -52,11 +54,12 @@ Shared control files:
 - One Slack app handles all users.
 - The bridge only responds in 1:1 Slack DMs.
 - One user maps to one sandbox and one workspace.
-- Per-user queues serialize work per claw.
+- Per-user queues serialize normal foreground `main` agent work per claw.
+- Long coding requests can run as isolated concurrent Claude jobs inside the same sandbox.
 - Pending Slack runs persist to disk and expire cleanly on restart.
 - Admin commands are handled directly on the host, not by the sandbox agent.
 - Shared runtime behavior comes from repo config instead of prompt drift.
-- Coding work stays in the foreground through the sandbox `main` agent.
+- Slack completion results are posted as new in-thread messages so desktop notifications can fire on completion.
 
 ---
 
@@ -110,7 +113,8 @@ The shared tool order is:
 
 | Capability | Current path |
 |------------|--------------|
-| Coding and repo work | Direct OpenClaw `main` agent inside the sandbox, foreground only |
+| Normal prompts and short repo queries | Direct OpenClaw `main` agent inside the sandbox |
+| Long coding and migration work | Isolated background Claude job inside the sandbox |
 | Freshrelease | In-sandbox Freshrelease MCP via `mcporter` |
 | Google tasks and calendar | In-sandbox `gog` |
 | Yahoo mail and email triage | Host-side `email-query.py` and `yahoo-mail.py` |
@@ -140,7 +144,8 @@ Per-user Claude setup resets the sandbox primary model back to Anthropic for nor
 Current bridge behavior includes:
 
 - DM-only routing for user requests
-- per-user queueing to avoid OpenClaw session lock conflicts
+- per-user queueing for normal foreground `main` agent requests
+- isolated background Claude coding jobs for long repo tasks
 - persisted pending-run recovery with stale-run cleanup on restart
 - direct admin command handling with audit logging
 - self-service `!setup` credential and workspace customization flows
@@ -148,6 +153,7 @@ Current bridge behavior includes:
 - natural-language Yahoo email queries routed through `email-query.py`
 - retry handling for the user's previous request
 - fail-closed handling for unknown `!` commands
+- final completion replies posted as new thread messages while placeholder messages are only updated with lightweight status text
 
 ### Admin Commands
 
@@ -195,7 +201,7 @@ Slack is the main operator and user interface.
 Validated or implemented capabilities in the current bridge include:
 
 - normal claw prompts
-- coding and repo tasks through the foreground sandbox `main` agent
+- coding and repo tasks through queued foreground `main` runs or isolated Claude coding jobs
 - Freshrelease and Google requests through in-sandbox tools
 - natural-language Yahoo inbox and search queries
 - direct `!yahoo` mail actions
@@ -207,6 +213,22 @@ Validated or implemented capabilities in the current bridge include:
 ### WhatsApp
 
 [scripts/whatsapp-bridge-multi.js](scripts/whatsapp-bridge-multi.js) remains in place for per-user messaging and notification forwarding. The Slack bridge can also forward notification-like messages to a user's configured WhatsApp number.
+
+---
+
+## Coding Job Execution
+
+Long-running coding prompts no longer depend on a single shared foreground OpenClaw conversation loop.
+
+Current behavior:
+
+- short prompts and normal information requests still run through `openclaw agent --agent main`
+- long coding prompts launch isolated `claude --permission-mode bypassPermissions --print` jobs inside the user's sandbox
+- each isolated coding job gets its own output and completion files under `/tmp`
+- multiple independent coding requests can run concurrently in the same sandbox
+- the bridge posts a new Slack thread message when the coding job completes, rather than editing the original placeholder
+
+This keeps normal information requests simple while reducing false timeouts and restoring final Slack notifications for long-running coding work.
 
 ---
 
